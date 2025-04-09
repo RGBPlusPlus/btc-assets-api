@@ -15,8 +15,32 @@ export class ElectrsClient implements IBitcoinDataProvider {
     return this.baseURL;
   }
 
+  /**
+   * Rounds up a number to the specified number of decimal places
+   * @param value - The number to round up
+   * @param decimalPlaces - Number of decimal places (default: 1)
+   * @returns The rounded number
+   */
+  private roundUpTo(value: number, decimalPlaces: number = 1): number {
+    const factor = Math.pow(10, decimalPlaces);
+    return Math.ceil(value * factor) / factor;
+  }
+
   public async getFeesRecommended(): Promise<RecommendedFees> {
-    throw new Error('Electrs: Recommended fees not available');
+    // The available confirmation targets are 1-25, 144, 504 and 1008 blocks.
+    // https://github.com/blockstream/esplora/blob/master/API.md#get-fee-estimates
+    const response = await this.request.get<Record<string, number>>('/fee-estimates');
+    const data = response.data;
+
+    const defaultFee = 1;
+
+    return {
+      fastestFee: this.roundUpTo(data['1'] ?? defaultFee),
+      halfHourFee: this.roundUpTo(data['3'] ?? defaultFee),
+      hourFee: this.roundUpTo(data['6'] ?? defaultFee),
+      economyFee: this.roundUpTo(data['3'] ?? defaultFee),
+      minimumFee: this.roundUpTo(data['144'] ?? defaultFee),
+    };
   }
 
   public async postTx({ txhex }: { txhex: string }) {
