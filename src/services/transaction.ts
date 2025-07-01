@@ -1,5 +1,6 @@
 import { bytes } from '@ckb-lumos/codec';
 import { remove0x, transactionToHex } from '@rgbpp-sdk/btc';
+import pLimit from 'p-limit';
 import {
   RGBPPLock,
   RGBPP_TX_ID_PLACEHOLDER,
@@ -96,6 +97,7 @@ export default class TransactionProcessor
 {
   private cradle: Cradle;
   private isRetryMissingTransactionsRunning = false;
+  private limit: pLimit.Limit;
 
   constructor(cradle: Cradle) {
     const defaultJobOptions = TransactionProcessor.getDefaultJobOptions(cradle.env);
@@ -110,6 +112,7 @@ export default class TransactionProcessor
       },
     });
     this.cradle = cradle;
+    this.limit = pLimit(20); // Control concurrency to avoid overwhelming CKB RPC
   }
 
   public static getDefaultJobOptions(env: Env) {
@@ -307,14 +310,12 @@ export default class TransactionProcessor
 
   /**
    * Append the spore cobuild witness to the transaction if the input contains spore cell
-   * (support spore transfer only for now, will support more in the future)
+   * (supports multiple spore transfers in a single transaction)
    * @param signedTx - the signed CKB transaction
    */
   private async appendSporeCobuildWitness(signedTx: CKBRawTransaction) {
     const inputs = await Promise.all(
-      signedTx.inputs.map(async (input) => {
-        return this.cradle.ckb.rpc.getLiveCell(input.previousOutput!, true);
-      }),
+      signedTx.inputs.map((input) => this.limit(() => this.cradle.ckb.rpc.getLiveCell(input.previousOutput!, true))),
     );
     const sporeLiveCells = inputs
       .filter(({ status, cell }) => {
@@ -324,7 +325,7 @@ export default class TransactionProcessor
     if (sporeLiveCells.length > 0) {
       signedTx.witnesses[signedTx.witnesses.length - 1] = generateSporeTransferCoBuild(
         sporeLiveCells,
-        signedTx.outputs.slice(0, 1),
+        signedTx.outputs,
       );
     }
     return signedTx;
