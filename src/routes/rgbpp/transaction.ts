@@ -12,7 +12,8 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
     '/ckb-tx',
     {
       schema: {
-        description: 'Submit a RGB++ CKB transaction',
+        description:
+          'Submit a RGB++ CKB transaction. Note: When including multiple assets, especially Spore, in a single transaction, please evaluate and ensure the final CKB transaction size does not exceed 512,000 bytes, otherwise the CKB node will reject it and permanently prevent RGB++ assets from being unlocked.',
         tags: ['RGB++'],
         body: z.object({
           btc_txid: z.string(),
