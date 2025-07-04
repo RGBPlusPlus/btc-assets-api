@@ -6,13 +6,15 @@ import { CKBVirtualResult } from './types';
 import { Job } from 'bullmq';
 import { CUSTOM_HEADERS } from '../../constants';
 import { JwtPayload } from '../../plugins/jwt';
+import { env } from '../../env';
 
 const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodTypeProvider> = (fastify, _, done) => {
   fastify.post(
     '/ckb-tx',
     {
       schema: {
-        description: 'Submit a RGB++ CKB transaction',
+        description:
+          'Submit a RGB++ CKB transaction. Note: When including multiple assets, especially Spore, in a single transaction, please evaluate and ensure the final CKB transaction size does not exceed 512,000 bytes, otherwise the CKB node will reject it and permanently prevent RGB++ assets from being unlocked.',
         tags: ['RGB++'],
         body: z.object({
           btc_txid: z.string(),
@@ -38,7 +40,21 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
     },
     async (request, reply) => {
       const { btc_txid, ckb_virtual_result } = request.body;
-      const jwt = (await request.jwtDecode()) as JwtPayload;
+
+      let jwt: JwtPayload;
+
+      // Development environment: use mock JWT payload
+      if (env.NODE_ENV === 'development') {
+        jwt = {
+          sub: 'dev-app',
+          aud: 'dev-rgbpp',
+          jti: 'dev-token-id',
+        };
+      } else {
+        // Production environment: use real JWT from request
+        jwt = request.user as JwtPayload;
+      }
+
       const job: Job = await fastify.transactionProcessor.enqueueTransaction({
         txid: btc_txid,
         ckbVirtualResult: ckb_virtual_result,

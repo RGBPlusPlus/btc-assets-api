@@ -10,23 +10,24 @@ A service for Retrieving BTC/RGB++ information/assets and processing transaction
 
 ## Get started
 
-We provide APIs for testnet and signet for use.
+We provide APIs for Testnet3 and Signet for use.
 
-- Testnet: [https://api.testnet.rgbpp.io](https://api.testnet.rgbpp.io/docs)
-- Signet: [https://api.signet.rgbpp.io](https://api.signet.rgbpp.io/docs)
+**Testnet3**
+- API Base URL: `https://api.testnet.rgbpp.io`
+- Swagger Documentation: https://api.testnet.rgbpp.io/docs
+
+**Signet**
+- API Base URL: `https://api.signet.rgbpp.io`
+- Swagger Documentation: https://api.signet.rgbpp.io/docs
 
 For mainnet, API is currently limited to verified apps only.
 You can also check the [Deployment](#Deployment) section to deploy your own.
 
 ### Get an access token
 
-#### Testnet
+#### Testnet3 & Signet
 
-You can get a testnet access token through the [/token/generate](https://api.testnet.rgbpp.io/docs/static/index.html#/Token/post_token_generate) API directly.
-
-### Signet
-
-And you can get an access token of BTC Signet network through the [/token/generate](https://api.signet.rgbpp.io/docs/static/index.html#/Token/post_token_generate) API directly.
+**No access token required** - You can directly access all API endpoints on Testnet3 and signet environments without authentication.
 
 #### Mainnet
 
