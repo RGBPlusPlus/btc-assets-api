@@ -35,15 +35,23 @@ export default fp(async (fastify) => {
   });
   fastify.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
     fastify.Sentry.setTag('request.url', request.url);
+
+    // Skip JWT authentication in development environment
+    if (env.NODE_ENV === 'development') {
+      return;
+    }
+
+    // Production environment: enable JWT verification
     if (
       request.method.toLowerCase() === 'options' ||
       JWT_IGNORE_URLS.some((prefix) => request.url.startsWith(prefix))
     ) {
       return;
     }
+
     try {
       await request.jwtVerify();
-      const jwt = (await request.jwtDecode()) as JwtPayload;
+      const jwt = request.user as JwtPayload;
       if (jwt) {
         fastify.Sentry.setTags({
           'token.id': jwt.jti,

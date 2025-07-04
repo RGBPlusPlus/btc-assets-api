@@ -10,7 +10,6 @@ const generateRoute: FastifyPluginCallback<Record<never, never>, Server, ZodType
     '/generate',
     {
       schema: {
-        tags: ['Token'],
         description: 'Generate a JWT token for the requester',
         body: z.object({
           app: z.string().default('my-app').describe('The app name of the requester'),
