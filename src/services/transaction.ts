@@ -317,17 +317,23 @@ export default class TransactionProcessor
     const inputs = await Promise.all(
       signedTx.inputs.map((input) => this.limit(() => this.cradle.ckb.rpc.getLiveCell(input.previousOutput!, true))),
     );
+
+    // Find spore input cells
     const sporeLiveCells = inputs
       .filter(({ status, cell }) => {
         return status === 'live' && cell?.output.type && isClusterSporeTypeSupported(cell?.output.type, IS_MAINNET);
       })
       .map((liveCell) => liveCell.cell!);
+
     if (sporeLiveCells.length > 0) {
-      signedTx.witnesses[signedTx.witnesses.length - 1] = generateSporeTransferCoBuild(
-        sporeLiveCells,
-        signedTx.outputs,
-      );
+      // Find all spore outputs
+      const sporeOutputs = signedTx.outputs.filter((output) => {
+        return output.type && isClusterSporeTypeSupported(output.type, IS_MAINNET);
+      });
+
+      signedTx.witnesses[signedTx.witnesses.length - 1] = generateSporeTransferCoBuild(sporeLiveCells, sporeOutputs);
     }
+
     return signedTx;
   }
 
