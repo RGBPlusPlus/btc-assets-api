@@ -9,6 +9,24 @@ import pkg from '../../package.json';
 export const DOCS_ROUTE_PREFIX = '/docs';
 
 export default fp(async (fastify) => {
+  // Create conditional security configuration based on environment
+  const securityConfig =
+    env.NODE_ENV === 'development'
+      ? {}
+      : {
+          security: [{ apiKey: [] }],
+          components: {
+            securitySchemes: {
+              apiKey: {
+                type: 'apiKey' as const,
+                name: 'Authorization',
+                in: 'header' as const,
+                description: 'JWT token for authentication. Example: Bearer <token>',
+              },
+            },
+          },
+        };
+
   fastify.register(swagger, {
     hideUntagged: true,
     openapi: {
@@ -17,17 +35,7 @@ export default fp(async (fastify) => {
         title: 'Bitcoin/RGB++ Assets API',
         version: pkg.version,
       },
-      security: [{ apiKey: [] }],
-      components: {
-        securitySchemes: {
-          apiKey: {
-            type: 'apiKey',
-            name: 'Authorization',
-            in: 'header',
-            description: 'JWT token for authentication. Example: Bearer <token>',
-          },
-        },
-      },
+      ...securityConfig,
     },
     transform: jsonSchemaTransform,
     transformObject: ({ openapiObject }) => {
