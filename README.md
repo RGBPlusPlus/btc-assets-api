@@ -34,7 +34,7 @@ You can also check the [Deployment](#Deployment) section to deploy your own.
 The mainnet is currently limited to verified apps only.
 
 When your app development is ready on testnet, and requires a mainnet access token,
-please email us at f@cell.studio to request a mainnet JWT token.
+please email us at [buidl@rgbpp.com](mailto:buidl@rgbpp.com) to request a mainnet JWT token.
 
 In the email, please provide the following information about your app:
 
