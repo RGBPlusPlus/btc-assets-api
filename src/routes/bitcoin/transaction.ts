@@ -4,6 +4,7 @@ import { Transaction } from './types';
 import { CUSTOM_HEADERS } from '../../constants';
 import z from 'zod';
 import { ZodTypeProvider } from 'fastify-type-provider-zod';
+import { TxOutspend } from '../../services/bitcoin/schema';
 
 const transactionRoutes: FastifyPluginCallback<Record<never, never>, Server, ZodTypeProvider> = (fastify, _, done) => {
   fastify.post(
@@ -78,6 +79,32 @@ const transactionRoutes: FastifyPluginCallback<Record<never, never>, Server, Zod
       return { hex };
     },
   );
+
+  fastify.get(
+    '/:txid/outspend/:vout',
+    {
+      schema: {
+        description: 'Get the spending status of a transaction output',
+        tags: ['Bitcoin'],
+        params: z.object({
+          txid: z.string().length(64, 'should be a 64-character hex string').describe('The Bitcoin transaction id'),
+          vout: z.string().min(1, 'cannot be empty').pipe(z.coerce.number().min(0, 'cannot be negative')),
+        }),
+        response: {
+          200: TxOutspend,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { txid, vout } = request.params;
+      const outspend = await fastify.bitcoin.getTxOutspend({ txid, vout });
+      if (outspend.spent || outspend.status?.confirmed) {
+        reply.header(CUSTOM_HEADERS.ResponseCacheable, 'true');
+      }
+      return outspend;
+    },
+  );
+
   done();
 };
 
