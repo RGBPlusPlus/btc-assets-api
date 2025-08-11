@@ -1,7 +1,7 @@
 import { Cradle } from '../../container';
 import { IBitcoinDataProvider } from './interface';
 import mempoolJS from '@mempool/mempool.js';
-import { Block, RecommendedFees, Transaction, UTXO } from './schema';
+import { Block, RecommendedFees, Transaction, TxOutspend, UTXO } from './schema';
 import * as Sentry from '@sentry/node';
 import { FeesMempoolBlocks } from '@mempool/mempool.js/lib/interfaces/bitcoin/fees';
 
@@ -149,5 +149,10 @@ export class MempoolClient implements IBitcoinDataProvider {
   public async getBlocksTipHash() {
     const response = await this.mempool.bitcoin.blocks.getBlocksTipHash();
     return response;
+  }
+
+  public async getTxOutspend({ txid, vout }: { txid: string; vout: number }) {
+    const response = await this.mempool.bitcoin.transactions.getTxOutspend({ txid, vout });
+    return TxOutspend.parse(response);
   }
 }

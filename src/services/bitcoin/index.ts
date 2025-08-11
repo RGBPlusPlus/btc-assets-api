@@ -245,4 +245,8 @@ export default class BitcoinClient implements IBitcoinClient {
   public async getBlocksTipHash() {
     return this.call('getBlocksTipHash');
   }
+
+  public async getTxOutspend({ txid, vout }: { txid: string; vout: number }) {
+    return this.call('getTxOutspend', { txid, vout });
+  }
 }

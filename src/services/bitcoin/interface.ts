@@ -1,4 +1,4 @@
-import { Block, RecommendedFees, Transaction, UTXO } from './schema';
+import { Block, RecommendedFees, Transaction, UTXO, TxOutspend } from './schema';
 
 export interface IBitcoinDataProvider {
   getBaseURL(): Promise<string>;
@@ -13,6 +13,7 @@ export interface IBitcoinDataProvider {
   getBlockHeader({ hash }: { hash: string }): Promise<string>;
   getBlockTxids({ hash }: { hash: string }): Promise<string[]>;
   getBlocksTipHash(): Promise<string>;
+  getTxOutspend({ txid, vout }: { txid: string; vout: number }): Promise<TxOutspend>;
 }
 
 export type IBitcoinBroadcastBackuper = Pick<IBitcoinDataProvider, 'getBaseURL' | 'postTx'>;

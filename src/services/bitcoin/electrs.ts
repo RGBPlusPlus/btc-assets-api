@@ -1,6 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { IBitcoinDataProvider } from './interface';
-import { Block, RecommendedFees, Transaction, UTXO } from './schema';
+import { Block, RecommendedFees, Transaction, UTXO, TxOutspend } from './schema';
 
 export class ElectrsClient implements IBitcoinDataProvider {
   private request: AxiosInstance;
@@ -94,6 +94,11 @@ export class ElectrsClient implements IBitcoinDataProvider {
 
   public async getBlocksTipHash() {
     const response = await this.request.get<string>('/blocks/tip/hash');
+    return response.data;
+  }
+
+  public async getTxOutspend({ txid, vout }: { txid: string; vout: number }) {
+    const response = await this.request.get<TxOutspend>(`/tx/${txid}/outspend/${vout}`);
     return response.data;
   }
 }

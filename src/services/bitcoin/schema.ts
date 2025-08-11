@@ -85,9 +85,17 @@ export const RecommendedFees = z.object({
   minimumFee: z.number(),
 });
 
+export const TxOutspend = z.object({
+  spent: z.boolean(),
+  txid: z.string().optional(),
+  vout: z.number().optional(),
+  status: Status.optional(),
+});
+
 export type ChainInfo = z.infer<typeof ChainInfo>;
 export type Block = z.infer<typeof Block>;
 export type Balance = z.infer<typeof Balance>;
 export type UTXO = z.infer<typeof UTXO>;
 export type Transaction = z.infer<typeof Transaction>;
 export type RecommendedFees = z.infer<typeof RecommendedFees>;
+export type TxOutspend = z.infer<typeof TxOutspend>;
