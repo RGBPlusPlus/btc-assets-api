@@ -72,6 +72,7 @@ const assetsRoute: FastifyPluginCallback<Record<never, never>, Server, ZodTypePr
           200: z.array(
             Cell.merge(
               z.object({
+                utxoSpent: z.boolean(),
                 typeHash: z.string().optional(),
               }),
             ),
@@ -81,6 +82,7 @@ const assetsRoute: FastifyPluginCallback<Record<never, never>, Server, ZodTypePr
     },
     async (request) => {
       const { btc_txid, vout } = request.params;
+      const outspend = await fastify.bitcoin.getTxOutspend({ txid: btc_txid, vout });
       const utxo: UTXO = {
         txid: btc_txid,
         vout,
@@ -96,6 +98,7 @@ const assetsRoute: FastifyPluginCallback<Record<never, never>, Server, ZodTypePr
         const typeHash = cell.cellOutput.type ? computeScriptHash(cell.cellOutput.type) : undefined;
         return {
           ...cell,
+          utxoSpent: outspend.spent,
           typeHash,
         };
       });
