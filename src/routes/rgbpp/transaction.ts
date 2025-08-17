@@ -107,8 +107,16 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
 
   const jobInfoSchema = z.object({
     state: z.string().describe('The state of the transaction'),
-    attempts: z.number().describe('The number of attempts made to process the transaction'),
+    attempts: z.number().describe('The number of processing attempts made'),
     failedReason: z.string().optional().describe('The reason why the transaction failed'),
+    lastError: z
+      .object({
+        attempt: z.number().describe('The attempt number when this error occurred'),
+        error: z.string().describe('The error message'),
+        timestamp: z.number().describe('The timestamp when this error occurred'),
+      })
+      .optional()
+      .describe('The latest error encountered during processing (for delayed jobs, this explains the delay reason)'),
     data: z
       .object({
         txid: z.string(),
@@ -131,6 +139,9 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
           * delayed: The transaction has not been confirmed yet and is waiting for confirmation.
           * active: The transaction is currently being processed.
           * waiting: The transaction is pending and is waiting to be processed.
+          
+          The response now includes the latest error information:
+          * lastError: The most recent error encountered during processing, with attempt number and timestamp. For delayed jobs, this explains why the job is delayed.
         `,
         tags: ['RGB++'],
         params: z.object({
@@ -153,11 +164,13 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
         return;
       }
       const state = await job.getState();
-      const attempts = job.attemptsMade;
+
+      // Get error info to calculate actual processing attempts and latest error
+      const { attemptCount, lastError } = await fastify.transactionProcessor.getJobErrorInfo(job);
 
       const jobInfo: z.infer<typeof jobInfoSchema> = {
         state,
-        attempts,
+        attempts: attemptCount,
       };
 
       if (with_data === 'true') {
@@ -168,8 +181,14 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
         };
       }
 
+      // Add error information for failed jobs
       if (state === 'failed') {
         jobInfo.failedReason = job.failedReason;
+      }
+
+      // Add latest error information
+      if (lastError) {
+        jobInfo.lastError = lastError;
       }
       return jobInfo;
     },

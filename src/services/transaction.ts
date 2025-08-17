@@ -21,7 +21,7 @@ import {
 } from '@rgbpp-sdk/ckb';
 import * as Sentry from '@sentry/node';
 import { Transaction as BitcoinTransaction } from 'bitcoinjs-lib';
-import { DelayedError, Job } from 'bullmq';
+import { DelayedError, Job, UnrecoverableError } from 'bullmq';
 import { Cradle } from '../container';
 import { Transaction } from '../routes/bitcoin/types';
 import { CKBRawTransaction, CKBVirtualResult, Cell } from '../routes/rgbpp/types';
@@ -211,11 +211,133 @@ export default class TransactionProcessor
   }
 
   /**
+   * Record error information in job logs for tracking retry history
+   * @param job - the job to record error for
+   * @param err - the error that occurred
+   */
+  private async recordJobError(job: Job<ITransactionRequest>, err: Error) {
+    // Get current error info to calculate the actual attempt number
+    const { attemptCount } = await this.getJobErrorInfo(job);
+    const actualAttemptNumber = attemptCount + 1;
+
+    const errorRecord = {
+      type: 'LATEST_ERROR',
+      attempt: actualAttemptNumber,
+      error: err.message,
+      timestamp: Date.now(),
+    };
+
+    // Use BullMQ's addJobLog with keepLogs to automatically limit log entries
+    // Keep only the latest error log (keepLogs = 1)
+    if (job.id) {
+      await Job.addJobLog(this.queue, job.id, JSON.stringify(errorRecord), 1);
+    }
+
+    this.cradle.logger.info(
+      `[TransactionProcessor] Recorded error for job ${job.id}, attempt ${errorRecord.attempt}: ${err.message}`,
+    );
+  }
+
+  /**
+   * Get the latest error and attempt count from job logs
+   * @param job - the job to get error info for
+   */
+  public async getJobErrorInfo(job: Job<ITransactionRequest>) {
+    try {
+      if (!job.id) {
+        return { attemptCount: 0, lastError: null };
+      }
+
+      // Use queue.getJobLogs to get logs for this job
+      const logsResult = await this.queue.getJobLogs(job.id);
+      const errorLogs = logsResult.logs
+        .map((log: string) => {
+          try {
+            const parsed = JSON.parse(log);
+            return parsed.type === 'LATEST_ERROR'
+              ? {
+                  attempt: parsed.attempt,
+                  error: parsed.error,
+                  timestamp: parsed.timestamp,
+                }
+              : null;
+          } catch {
+            return null;
+          }
+        })
+        .filter((item): item is { attempt: number; error: string; timestamp: number } => item !== null);
+
+      // Since we only keep 1 log entry, attemptCount comes from the log entry itself
+      const lastError = errorLogs.length > 0 ? errorLogs[0] : null;
+      const attemptCount = lastError ? lastError.attempt : 0;
+
+      return { attemptCount, lastError };
+    } catch (error) {
+      this.cradle.logger.warn(`[TransactionProcessor] Failed to get error info for job ${job.id}:`, error);
+      return { attemptCount: 0, lastError: null };
+    }
+  }
+
+  /**
+   * Get error history from job logs (for backward compatibility)
+   * @param job - the job to get error history for
+   */
+  public async getJobErrorHistory(job: Job<ITransactionRequest>) {
+    const { lastError } = await this.getJobErrorInfo(job);
+    return lastError ? [lastError] : [];
+  }
+
+  /**
+   * Check if an error is permanent and should not be retried
+   * @param err - the error to check
+   * @returns true if the error is permanent
+   */
+  private isPermanentError(err: Error): boolean {
+    // CKB RPC permanent errors
+    if (err instanceof CKBRpcError) {
+      switch (err.code) {
+        case CKBRPCErrorCodes.TransactionFailedToVerify:
+          // Transaction verification failed - permanent failure
+          return true;
+        case CKBRPCErrorCodes.TransactionFailedToResolve:
+          // Failed to resolve inputs/deps - usually permanent
+          return true;
+        case CKBRPCErrorCodes.PoolRejectedTransactionByOutputsValidator:
+          // Output validation failed - permanent failure
+          return true;
+        case CKBRPCErrorCodes.PoolRejectedTransactionBySizeLimit:
+          // Transaction too large - permanent failure
+          return true;
+        case CKBRPCErrorCodes.PoolRejectedMalformedTransaction:
+          // Malformed transaction - permanent failure
+          return true;
+        default:
+          // Other CKB errors might be temporary (network issues, pool full, etc.)
+          return false;
+      }
+    }
+
+    // Application-level permanent errors
+    if (err instanceof InvalidTransactionError) {
+      // Invalid transaction structure/data - permanent failure
+      return true;
+    }
+
+    // All other errors are considered potentially recoverable
+    return false;
+  }
+
+  /**
    * Move job to delayed
    * @param job - the job to move
    * @param token - the token to move the job
+   * @param err - the error that caused the delay
    */
-  private async moveJobToDelayed(job: Job<ITransactionRequest>, token?: string) {
+  private async moveJobToDelayed(job: Job<ITransactionRequest>, token?: string, err?: Error) {
+    if (err) {
+      await this.recordJobError(job, err);
+    }
+
     this.cradle.logger.info(`[TransactionProcessor] Moving job ${job.id} to delayed queue`);
     const timestamp = Date.now() + this.cradle.env.TRANSACTION_QUEUE_JOB_DELAY;
     await job.moveToDelayed(timestamp, token);
@@ -380,7 +502,7 @@ export default class TransactionProcessor
    * Fix the pool rejected transaction by increasing the fee rate
    * set the needPaymasterCell to true to append the paymaster cell to pay the rest of the fee
    */
-  private async fixPoolRejectedTransactionByMinFeeRate(job: Job<ITransactionRequest>) {
+  private async fixPoolRejectedTransactionByMinFeeRate(job: Job<ITransactionRequest>, token?: string, err?: Error) {
     this.cradle.logger.debug(
       `[TransactionProcessor] Fix pool rejected transaction by increasing the fee rate: ${job.data.txid}`,
     );
@@ -397,7 +519,7 @@ export default class TransactionProcessor
         needPaymasterCell: true,
       },
     });
-    await this.moveJobToDelayed(job);
+    await this.moveJobToDelayed(job, token, err);
   }
 
   /**
@@ -467,11 +589,26 @@ export default class TransactionProcessor
           err.code === CKBRPCErrorCodes.PoolRejectedTransactionByMinFeeRate &&
           this.cradle.env.TRANSACTION_PAY_FOR_MIN_FEE_RATE_REJECT
         ) {
-          await this.fixPoolRejectedTransactionByMinFeeRate(job);
+          await this.fixPoolRejectedTransactionByMinFeeRate(job, token, err as Error);
           return;
         }
+
         // mark the paymaster cell as unspent if the transaction failed
         this.cradle.paymaster.markPaymasterCellAsUnspent(txid, signedTx!);
+
+        // Check for permanent failures that should not be retried
+        if (this.isPermanentError(err as Error)) {
+          // Record error and fail immediately without BullMQ retries
+          await this.recordJobError(job, err as Error);
+          this.captureJobExceptionToSentryScope(job, err as Error);
+          this.cradle.logger.error(
+            `[TransactionProcessor] Permanent failure for job ${job.id}, will not retry: ${(err as Error).message}`,
+          );
+
+          // Use UnrecoverableError to prevent BullMQ from retrying
+          throw new UnrecoverableError((err as Error).message);
+        }
+
         throw err;
       }
     } catch (err) {
@@ -484,7 +621,7 @@ export default class TransactionProcessor
         // for example, if the delay is 120s and the attempts is 6, the not found tolerance time is 120 * (2 ** 6) ~= 2 hours
         const notFoundToleranceTime = TRANSACTION_QUEUE_JOB_DELAY * 2 ** TRANSACTION_QUEUE_JOB_ATTEMPTS;
         if (Date.now() - job.timestamp < notFoundToleranceTime) {
-          await this.moveJobToDelayed(job, token);
+          await this.moveJobToDelayed(job, token, err as Error);
           return;
         }
       }
@@ -493,9 +630,12 @@ export default class TransactionProcessor
       const transactionNotConfirmed = err instanceof TransactionNotConfirmedError;
       const spvProofNotReady = err instanceof BitcoinSPVError;
       if (transactionNotConfirmed || spvProofNotReady) {
-        await this.moveJobToDelayed(job, token);
+        await this.moveJobToDelayed(job, token, err as Error);
         return;
       }
+
+      // Record the error before throwing (for recoverable failures that should be retried)
+      await this.recordJobError(job, err as Error);
       this.captureJobExceptionToSentryScope(job, err as Error);
       throw err;
     }
