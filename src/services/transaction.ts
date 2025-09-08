@@ -10,6 +10,7 @@ import {
   getSporeTypeDep,
   isClusterSporeTypeSupported,
   updateCkbTxWithRealBtcTxId,
+  fetchCellDepsJson,
 } from '@rgbpp-sdk/ckb';
 import {
   btcTxIdAndAfterFromBtcTimeLockArgs,
@@ -26,7 +27,7 @@ import { Cradle } from '../container';
 import { Transaction } from '../routes/bitcoin/types';
 import { CKBRawTransaction, CKBVirtualResult, Cell } from '../routes/rgbpp/types';
 import { BitcoinSPVError } from './spv';
-import { BI } from '@ckb-lumos/lumos';
+import { BI, CellDep } from '@ckb-lumos/lumos';
 import { CKBRpcError, CKBRPCErrorCodes } from './ckb';
 import { cloneDeep } from 'lodash';
 import { JwtPayload } from '../plugins/jwt';
@@ -98,6 +99,7 @@ export default class TransactionProcessor
   private cradle: Cradle;
   private isRetryMissingTransactionsRunning = false;
   private limit: pLimit.Limit;
+  private deadCellCache = new Set<string>(); // cache for dead cells to avoid repeated RPC calls
 
   constructor(cradle: Cradle) {
     const defaultJobOptions = TransactionProcessor.getDefaultJobOptions(cradle.env);
@@ -523,6 +525,169 @@ export default class TransactionProcessor
   }
 
   /**
+   * Check cell status and update cache
+   * @param cellKey - the cell key for caching
+   * @param outPoint - the cell outPoint to check
+   * @returns Promise<boolean> - true if cell is live, false if dead
+   */
+  private async checkCellStatus(cellKey: string, outPoint: { txHash: string; index: string }): Promise<boolean> {
+    try {
+      const cell = await this.cradle.ckb.rpc.getLiveCell(outPoint, false);
+      if (cell.status === 'live') {
+        return true;
+      } else {
+        // cache dead cell to avoid future RPC calls
+        this.deadCellCache.add(cellKey);
+        return false;
+      }
+    } catch (error) {
+      // if rpc call fails, assume cell is live (conservative approach)
+      this.cradle.logger.warn(`[TransactionProcessor] Failed to check cell status for ${cellKey}: ${error}`);
+      return true;
+    }
+  }
+
+  /**
+   * Repair transaction by optimizing cell dependencies and adding required lock scripts
+   *
+   * This method handles script-related transaction failures by:
+   * 1. Filtering out dead cell dependencies
+   * 2. Dynamically adding the latest cell dependencies for RGB++ and BTC time lock scripts
+   */
+  private async fixTransactionCellDependencies(job: Job<ITransactionRequest>, token?: string, err?: Error) {
+    this.cradle.logger.debug(`[TransactionProcessor] Fixing transaction cell dependencies: ${job.data.txid}`);
+    const { txid, ckbVirtualResult } = job.data;
+    const { ckbRawTx } = ckbVirtualResult;
+
+    // remove cell deps whose outPoint are dead cells
+    try {
+      const cellDepResults = await Promise.all(
+        ckbRawTx.cellDeps.map(async (cellDep) => {
+          if (!cellDep.outPoint) {
+            return null;
+          }
+
+          const cellKey = `${cellDep.outPoint.txHash}:${cellDep.outPoint.index}`;
+
+          try {
+            // check cache first to avoid repeated RPC calls
+            if (this.deadCellCache.has(cellKey)) {
+              return null;
+            }
+
+            // check cell status with concurrency control
+            const isLiveCell = await this.limit(() => this.checkCellStatus(cellKey, cellDep.outPoint!));
+            if (!isLiveCell) {
+              this.cradle.logger.debug(`[TransactionProcessor] Removed dead cell dep: ${cellKey}`);
+              return null;
+            }
+
+            return cellDep;
+          } catch {
+            // if rpc getLiveCell failed, keep the cell dep
+            return cellDep;
+          }
+        }),
+      );
+
+      const liveCellDeps = cellDepResults.filter(Boolean) as CellDep[];
+      const originalCount = ckbRawTx.cellDeps.length;
+      ckbRawTx.cellDeps = liveCellDeps;
+      this.cradle.logger.debug(
+        `[TransactionProcessor] Filtered cell deps, kept ${liveCellDeps.length}/${originalCount} live cell deps`,
+      );
+    } catch (error) {
+      this.cradle.logger.warn(`[TransactionProcessor] Failed to filter dead cell deps: ${error}`);
+      // if the whole process failed, keep the original cell deps
+    }
+
+    // add the latest RGB++ and BTC time lock cell deps as needed
+    try {
+      let rgbppCellDepRequired = false,
+        btcTimeLockCellDepRequired = false;
+
+      const inputs = await Promise.all(
+        ckbRawTx.inputs.map((input) => this.limit(() => this.cradle.ckb.rpc.getLiveCell(input.previousOutput!, false))),
+      );
+
+      // check which cell deps are needed
+      for (const input of inputs) {
+        if (input.status === 'live' && input.cell) {
+          const lock = input.cell.output.lock;
+          if (isRgbppLock(lock)) {
+            rgbppCellDepRequired = true;
+          } else if (isBtcTimeLock(lock)) {
+            btcTimeLockCellDepRequired = true;
+          }
+          // early exit if both are found
+          if (rgbppCellDepRequired && btcTimeLockCellDepRequired) {
+            break;
+          }
+        }
+      }
+
+      if (rgbppCellDepRequired || btcTimeLockCellDepRequired) {
+        const latestCellDeps = await fetchCellDepsJson();
+        const rgbppCellDeps = IS_MAINNET ? latestCellDeps!.rgbpp.mainnet : latestCellDeps!.rgbpp.testnet;
+        const btcTimeLockDeps = IS_MAINNET ? latestCellDeps!.btcTime.mainnet : latestCellDeps!.btcTime.testnet;
+
+        let rgbppDepAdded = false,
+          btcTimeLockDepAdded = false;
+
+        if (rgbppCellDepRequired) {
+          // check if RGB++ cell dep already exists to avoid duplicates
+          const hasLatestRgbppDep = ckbRawTx.cellDeps.some(
+            (dep) =>
+              dep.outPoint?.txHash === rgbppCellDeps.outPoint?.txHash &&
+              dep.outPoint?.index === rgbppCellDeps.outPoint?.index &&
+              dep.depType === rgbppCellDeps.depType,
+          );
+          if (!hasLatestRgbppDep) {
+            ckbRawTx.cellDeps.unshift(rgbppCellDeps, {
+              ...rgbppCellDeps,
+              outPoint: { ...rgbppCellDeps.outPoint, index: '0x1' },
+            } as CellDep);
+            rgbppDepAdded = true;
+          }
+        }
+        if (btcTimeLockCellDepRequired) {
+          // check if BTC time lock cell dep already exists to avoid duplicates
+          const hasLatestBtcTimeLockDep = ckbRawTx.cellDeps.some(
+            (dep) =>
+              dep.outPoint?.txHash === btcTimeLockDeps.outPoint?.txHash &&
+              dep.outPoint?.index === btcTimeLockDeps.outPoint?.index &&
+              dep.depType === btcTimeLockDeps.depType,
+          );
+          if (!hasLatestBtcTimeLockDep) {
+            ckbRawTx.cellDeps.unshift(btcTimeLockDeps, {
+              ...btcTimeLockDeps,
+              outPoint: { ...btcTimeLockDeps.outPoint, index: '0x1' },
+            } as CellDep);
+            btcTimeLockDepAdded = true;
+          }
+        }
+
+        this.cradle.logger.debug(
+          `[TransactionProcessor] Cell deps status - RGB++ required: ${rgbppCellDepRequired}, added: ${rgbppDepAdded}, BTC TimeLock required: ${btcTimeLockCellDepRequired}, added: ${btcTimeLockDepAdded}`,
+        );
+      }
+    } catch (error) {
+      this.cradle.logger.warn(`[TransactionProcessor] Failed to add latest cell deps: ${error}`);
+      // continue without adding cell deps - the transaction might still work
+    }
+
+    job.updateData({
+      txid,
+      ckbVirtualResult: {
+        ...ckbVirtualResult,
+        ckbRawTx,
+      },
+    });
+
+    await this.moveJobToDelayed(job, token, err);
+  }
+
+  /**
    * Process the transaction request, called by the worker
    * - get the Bitcoin transaction
    * - verify the transaction request
@@ -595,6 +760,14 @@ export default class TransactionProcessor
 
         // mark the paymaster cell as unspent if the transaction failed
         this.cradle.paymaster.markPaymasterCellAsUnspent(txid, signedTx!);
+
+        if (
+          err instanceof CKBRpcError &&
+          (err.message.includes('ScriptNotFound') || err.message.includes('Unknown(OutPoint'))
+        ) {
+          await this.fixTransactionCellDependencies(job, token, err as Error);
+          return;
+        }
 
         // Check for permanent failures that should not be retried
         if (this.isPermanentError(err as Error)) {
