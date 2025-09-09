@@ -583,7 +583,10 @@ export default class TransactionProcessor
             }
 
             return cellDep;
-          } catch {
+          } catch (error) {
+            this.cradle.logger.warn(
+              `[TransactionProcessor] Error checking cell dep status for ${cellKey}, keeping it: ${error}`,
+            );
             // if rpc getLiveCell failed, keep the cell dep
             return cellDep;
           }
@@ -627,9 +630,26 @@ export default class TransactionProcessor
       }
 
       if (rgbppCellDepRequired || btcTimeLockCellDepRequired) {
-        const latestCellDeps = await fetchCellDepsJson();
-        const rgbppCellDeps = IS_MAINNET ? latestCellDeps!.rgbpp.mainnet : latestCellDeps!.rgbpp.testnet;
-        const btcTimeLockDeps = IS_MAINNET ? latestCellDeps!.btcTime.mainnet : latestCellDeps!.btcTime.testnet;
+        let latestCellDeps: Awaited<ReturnType<typeof fetchCellDepsJson>>;
+        try {
+          latestCellDeps = await fetchCellDepsJson();
+        } catch (error) {
+          throw new Error(
+            `Unable to fetch required cell dependencies: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          );
+        }
+
+        if (!latestCellDeps) {
+          throw new Error('Cell dependencies fetch returned empty response - unable to repair transaction');
+        }
+
+        const network = IS_MAINNET ? 'mainnet' : 'testnet';
+        if (!latestCellDeps.rgbpp?.[network] || !latestCellDeps.btcTime?.[network]) {
+          throw new Error(`Missing ${network} cell dependencies configuration`);
+        }
+
+        const rgbppCellDeps = latestCellDeps.rgbpp[network];
+        const btcTimeLockDeps = latestCellDeps.btcTime[network];
 
         let rgbppDepAdded = false,
           btcTimeLockDepAdded = false;
@@ -643,6 +663,9 @@ export default class TransactionProcessor
               dep.depType === rgbppCellDeps.depType,
           );
           if (!hasLatestRgbppDep) {
+            if (!rgbppCellDeps.outPoint) {
+              throw new Error('RGB++ lock cell dependency missing outPoint - cannot repair transaction');
+            }
             ckbRawTx.cellDeps.unshift(rgbppCellDeps, {
               ...rgbppCellDeps,
               outPoint: { ...rgbppCellDeps.outPoint, index: '0x1' },
@@ -659,6 +682,9 @@ export default class TransactionProcessor
               dep.depType === btcTimeLockDeps.depType,
           );
           if (!hasLatestBtcTimeLockDep) {
+            if (!btcTimeLockDeps.outPoint) {
+              throw new Error('BTC time lock cell dependency missing outPoint - cannot repair transaction');
+            }
             ckbRawTx.cellDeps.unshift(btcTimeLockDeps, {
               ...btcTimeLockDeps,
               outPoint: { ...btcTimeLockDeps.outPoint, index: '0x1' },
@@ -763,6 +789,8 @@ export default class TransactionProcessor
 
         if (
           err instanceof CKBRpcError &&
+          (err.code === CKBRPCErrorCodes.TransactionFailedToResolve ||
+            err.code === CKBRPCErrorCodes.TransactionFailedToVerify) &&
           (err.message.includes('ScriptNotFound') || err.message.includes('Unknown(OutPoint'))
         ) {
           await this.fixTransactionCellDependencies(job, token, err as Error);
