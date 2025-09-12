@@ -99,7 +99,7 @@ export default class TransactionProcessor
   private cradle: Cradle;
   private isRetryMissingTransactionsRunning = false;
   private limit: pLimit.Limit;
-  private deadCellCache = new Set<string>(); // cache for dead cells to avoid repeated RPC calls
+  private deadCellMap = new Set<string>();
 
   constructor(cradle: Cradle) {
     const defaultJobOptions = TransactionProcessor.getDefaultJobOptions(cradle.env);
@@ -115,6 +115,8 @@ export default class TransactionProcessor
     });
     this.cradle = cradle;
     this.limit = pLimit(20); // Control concurrency to avoid overwhelming CKB RPC
+
+    this.initializeDeadCellCacheWithKnownDeadCells();
   }
 
   public static getDefaultJobOptions(env: Env) {
@@ -125,6 +127,25 @@ export default class TransactionProcessor
         delay: env.TRANSACTION_QUEUE_JOB_DELAY,
       },
     };
+  }
+
+  private initializeDeadCellCacheWithKnownDeadCells() {
+    this.cradle.env.KNOWN_DEAD_CELLS.forEach((cell) => {
+      const [txHash, index] = cell.split(':');
+
+      // validate txHash and index format
+      try {
+        if (!txHash.startsWith('0x') || txHash.length !== 66 || !index.startsWith('0x')) {
+          throw new Error('Invalid format');
+        }
+        BigInt(index); // validates hex integer
+      } catch {
+        this.cradle.logger.warn(`[TransactionProcessor] Invalid index in known dead cell: ${cell}`);
+        return;
+      }
+
+      this.deadCellMap.add(this.deadCellMapKey({ txHash, index }));
+    });
   }
 
   /**
@@ -524,84 +545,45 @@ export default class TransactionProcessor
     await this.moveJobToDelayed(job, token, err);
   }
 
-  /**
-   * Check cell status and update cache
-   * @param cellKey - the cell key for caching
-   * @param outPoint - the cell outPoint to check
-   * @returns Promise<boolean> - true if cell is live, false if dead
-   */
-  private async checkCellStatus(cellKey: string, outPoint: { txHash: string; index: string }): Promise<boolean> {
-    try {
-      const cell = await this.cradle.ckb.rpc.getLiveCell(outPoint, false);
-      if (cell.status === 'live') {
-        return true;
-      } else {
-        // cache dead cell to avoid future RPC calls
-        this.deadCellCache.add(cellKey);
-        return false;
-      }
-    } catch (error) {
-      // if rpc call fails, assume cell is live (conservative approach)
-      this.cradle.logger.warn(`[TransactionProcessor] Failed to check cell status for ${cellKey}: ${error}`);
-      return true;
-    }
+  private deadCellMapKey(outPoint: { txHash: string; index: string }) {
+    return `${outPoint.txHash}:${outPoint.index}`;
   }
 
   /**
-   * Repair transaction by optimizing cell dependencies and adding required lock scripts
-   *
-   * This method handles script-related transaction failures by:
-   * 1. Filtering out dead cell dependencies
-   * 2. Dynamically adding the latest cell dependencies for RGB++ and BTC time lock scripts
+   * Repair transaction by filtering out known dead cell dependencies and adding required lock scripts cell deps
    */
   private async fixTransactionCellDependencies(job: Job<ITransactionRequest>, token?: string, err?: Error) {
     this.cradle.logger.debug(`[TransactionProcessor] Fixing transaction cell dependencies: ${job.data.txid}`);
     const { txid, ckbVirtualResult } = job.data;
     const { ckbRawTx } = ckbVirtualResult;
 
-    // remove cell deps whose outPoint are dead cells
-    try {
-      const cellDepResults = await Promise.all(
-        ckbRawTx.cellDeps.map(async (cellDep) => {
-          if (!cellDep.outPoint) {
-            return null;
-          }
+    // filter out known dead cells from cellDeps
+    let hasTargetDeadCellDeps = false;
+    const originalCellDepsCount = ckbRawTx.cellDeps.length;
+    ckbRawTx.cellDeps = ckbRawTx.cellDeps.filter((cellDep) => {
+      if (!cellDep.outPoint) {
+        return false;
+      }
 
-          const cellKey = `${cellDep.outPoint.txHash}:${cellDep.outPoint.index}`;
+      const cellKey = this.deadCellMapKey(cellDep.outPoint);
+      if (this.deadCellMap.has(cellKey)) {
+        this.cradle.logger.debug(`[TransactionProcessor] Removed known dead cell dep: ${cellKey}`);
+        hasTargetDeadCellDeps = true;
+        return false;
+      }
 
-          try {
-            // check cache first to avoid repeated RPC calls
-            if (this.deadCellCache.has(cellKey)) {
-              return null;
-            }
+      return true;
+    });
 
-            // check cell status with concurrency control
-            const isLiveCell = await this.limit(() => this.checkCellStatus(cellKey, cellDep.outPoint!));
-            if (!isLiveCell) {
-              this.cradle.logger.debug(`[TransactionProcessor] Removed dead cell dep: ${cellKey}`);
-              return null;
-            }
+    this.cradle.logger.debug(
+      `[TransactionProcessor] Filtered cell deps, kept ${ckbRawTx.cellDeps.length}/${originalCellDepsCount} live cell deps`,
+    );
 
-            return cellDep;
-          } catch (error) {
-            this.cradle.logger.warn(
-              `[TransactionProcessor] Error checking cell dep status for ${cellKey}, keeping it: ${error}`,
-            );
-            // if rpc getLiveCell failed, keep the cell dep
-            return cellDep;
-          }
-        }),
-      );
-
-      const liveCellDeps = cellDepResults.filter(Boolean) as CellDep[];
-      const originalCount = ckbRawTx.cellDeps.length;
-      ckbRawTx.cellDeps = liveCellDeps;
-      this.cradle.logger.debug(
-        `[TransactionProcessor] Filtered cell deps, kept ${liveCellDeps.length}/${originalCount} live cell deps`,
-      );
-    } catch (error) {
-      this.cradle.logger.warn(`[TransactionProcessor] Failed to filter dead cell deps: ${error}`);
-      // if the whole process failed, keep the original cell deps
+    if (!hasTargetDeadCellDeps) {
+      // in this case, the problem goes beyond the capacity of this method to fix, the repair process stops right here
+      this.cradle.logger.debug(`[TransactionProcessor] No matched dead cell deps found`);
+      // throw the original error
+      throw err;
     }
 
     // add the latest RGB++ and BTC time lock cell deps as needed
@@ -699,7 +681,6 @@ export default class TransactionProcessor
       }
     } catch (error) {
       this.cradle.logger.warn(`[TransactionProcessor] Failed to add latest cell deps: ${error}`);
-      // continue without adding cell deps - the transaction might still work
     }
 
     job.updateData({
@@ -789,12 +770,24 @@ export default class TransactionProcessor
 
         if (
           err instanceof CKBRpcError &&
-          (err.code === CKBRPCErrorCodes.TransactionFailedToResolve ||
-            err.code === CKBRPCErrorCodes.TransactionFailedToVerify) &&
-          (err.message.includes('ScriptNotFound') || err.message.includes('Unknown(OutPoint'))
+          err.code === CKBRPCErrorCodes.TransactionFailedToResolve &&
+          err.message.includes('Unknown(OutPoint')
         ) {
-          await this.fixTransactionCellDependencies(job, token, err as Error);
-          return;
+          try {
+            await this.fixTransactionCellDependencies(job, token, err as Error);
+            return;
+          } catch (fixError) {
+            // check if it's a DelayedError (normal delay signal)
+            if (fixError instanceof DelayedError) {
+              // re-throw DelayedError to properly signal BullMQ
+              this.cradle.logger.debug(
+                `[TransactionProcessor] Successfully delayed the job after trying to fix cell dependencies`,
+              );
+              throw fixError;
+            }
+            // unfixed the error, continue the following process
+            this.cradle.logger.debug(`[TransactionProcessor] Failed to fix cell dependencies: ${fixError}`);
+          }
         }
 
         // Check for permanent failures that should not be retried
