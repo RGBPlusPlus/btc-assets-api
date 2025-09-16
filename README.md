@@ -10,15 +10,14 @@ A service for Retrieving BTC/RGB++ information/assets and processing transaction
 
 ## Get started
 
-We provide APIs for Testnet3 and Signet for use.
+We provide APIs for Testnet3 for public use.
 
 **Testnet3**
-- API Base URL: `https://api.testnet.rgbpp.io`
-- Swagger Documentation: https://api.testnet.rgbpp.io/docs
-
-**Signet**
-- API Base URL: `https://api.signet.rgbpp.io`
-- Swagger Documentation: https://api.signet.rgbpp.io/docs
+- API Base URL: 
+  1. `https://api-testnet.rgbpp.com`
+     - Swagger Documentation: https://api-testnet.rgbpp.com/docs
+  2. `https://api.testnet.rgbpp.io`
+     - Swagger Documentation: https://api.testnet.rgbpp.io/docs
 
 For mainnet, API is currently limited to verified apps only.
 You can also check the [Deployment](#Deployment) section to deploy your own.
@@ -48,7 +47,9 @@ In the email, please provide the following information about your app:
 - [mempool.space](https://mempool.space/docs) or [mempool/electrs](https://github.com/mempool/electrs): provides data about the Bitcoin network.
   - We can use either of them as data provider
   - Or use both, designating one as the primary provider and the other as the fallback
-- [ckb-cell/ckb-bitcoin-spv-service](https://github.com/ckb-cell/ckb-bitcoin-spv-service): CKB Bitcoin SPV Service
+- [ckb-cell/ckb-bitcoin-spv-service](https://github.com/ckb-cell/ckb-bitcoin-spv-service): CKB Bitcoin SPV Service for Bitcoin block header verification
+  - **Testnet3**: Public SPV service available at `https://spv-testnet.rgbpp.com`
+  - **Mainnet**: Please email us at [buidl@rgbpp.com](mailto:buidl@rgbpp.com) for more information
 
 #### Configuration
 
