@@ -123,8 +123,17 @@ export default class BitcoinClient implements IBitcoinClient {
       let calledError = err;
       this.cradle.logger.error(err);
       Sentry.captureException(err);
-      if (fallback) {
-        this.cradle.logger.warn(`Fallback to ${fallback.constructor.name} due to error: ${(err as Error).message}`);
+
+      // Don't fallback for client errors (4xx), as they indicate invalid requests
+      const shouldSkipFallback =
+        isAxiosError(err) && err.response?.status && err.response.status >= 400 && err.response.status < 500;
+      if (shouldSkipFallback) {
+        this.cradle.logger.debug(`Skip fallback: status=${err.response?.status}`);
+      }
+
+      if (fallback && !shouldSkipFallback) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        this.cradle.logger.warn(`Fallback to ${fallback.constructor.name} due to error: ${errorMessage}`);
         try {
           const result = await (fallback[method] as Function).apply(fallback, args);
           return result as MethodReturnType<IBitcoinDataProvider, K>;
