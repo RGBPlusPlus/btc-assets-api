@@ -59,6 +59,12 @@ const envSchema = z
       .transform((value) => value.split(','))
       .pipe(z.string().array()),
 
+    /**
+     * Health check timeout in milliseconds
+     * Default is 5000ms (5 seconds)
+     */
+    HEALTHCHECK_TIMEOUT_MS: z.coerce.number().default(5000),
+
     ADMIN_USERNAME: z.string().optional(),
     ADMIN_PASSWORD: z.string().optional(),
 
