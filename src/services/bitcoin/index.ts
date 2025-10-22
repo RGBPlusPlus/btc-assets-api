@@ -126,7 +126,7 @@ export default class BitcoinClient implements IBitcoinClient {
 
       // Don't fallback for client errors (4xx), as they indicate invalid requests
       const shouldSkipFallback =
-        isAxiosError(err) && err.response?.status && err.response.status >= 400 && err.response.status < 500;
+        isAxiosError(err) && err.response && err.response.status >= 400 && err.response.status < 500;
       if (shouldSkipFallback) {
         this.cradle.logger.debug(`Skip fallback: status=${err.response?.status}`);
       }
