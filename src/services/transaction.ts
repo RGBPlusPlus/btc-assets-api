@@ -27,7 +27,7 @@ import { Cradle } from '../container';
 import { Transaction } from '../routes/bitcoin/types';
 import { CKBRawTransaction, CKBVirtualResult, Cell } from '../routes/rgbpp/types';
 import { BitcoinSPVError } from './spv';
-import { BI, CellDep } from '@ckb-lumos/lumos';
+import { BI } from '@ckb-lumos/lumos';
 import { CKBRpcError, CKBRPCErrorCodes } from './ckb';
 import { cloneDeep } from 'lodash';
 import { JwtPayload } from '../plugins/jwt';
@@ -38,6 +38,7 @@ import BaseQueueWorker from './base/queue-worker';
 import { Env } from '../env';
 import { getCommitmentFromBtcTx } from '../utils/commitment';
 import { isBtcTimeLock, isRgbppLock } from '../utils/lockscript';
+import { addLatestCellDepIfNeeded } from '../utils/cell-deps';
 import { IS_MAINNET } from '../constants';
 
 export interface ITransactionRequest {
@@ -630,53 +631,20 @@ export default class TransactionProcessor
           throw new Error(`Missing ${network} cell dependencies configuration`);
         }
 
-        const rgbppCellDeps = latestCellDeps.rgbpp[network];
-        const btcTimeLockDeps = latestCellDeps.btcTime[network];
+        const latestRgbppDepAdded = addLatestCellDepIfNeeded(
+          ckbRawTx,
+          latestCellDeps.rgbpp[network],
+          rgbppCellDepRequired,
+        );
 
-        let rgbppDepAdded = false,
-          btcTimeLockDepAdded = false;
-
-        if (rgbppCellDepRequired) {
-          // check if RGB++ cell dep already exists to avoid duplicates
-          const hasLatestRgbppDep = ckbRawTx.cellDeps.some(
-            (dep) =>
-              dep.outPoint?.txHash === rgbppCellDeps.outPoint?.txHash &&
-              dep.outPoint?.index === rgbppCellDeps.outPoint?.index &&
-              dep.depType === rgbppCellDeps.depType,
-          );
-          if (!hasLatestRgbppDep) {
-            if (!rgbppCellDeps.outPoint) {
-              throw new Error('RGB++ lock cell dependency missing outPoint - cannot repair transaction');
-            }
-            ckbRawTx.cellDeps.unshift(rgbppCellDeps, {
-              ...rgbppCellDeps,
-              outPoint: { ...rgbppCellDeps.outPoint, index: '0x1' },
-            } as CellDep);
-            rgbppDepAdded = true;
-          }
-        }
-        if (btcTimeLockCellDepRequired) {
-          // check if BTC time lock cell dep already exists to avoid duplicates
-          const hasLatestBtcTimeLockDep = ckbRawTx.cellDeps.some(
-            (dep) =>
-              dep.outPoint?.txHash === btcTimeLockDeps.outPoint?.txHash &&
-              dep.outPoint?.index === btcTimeLockDeps.outPoint?.index &&
-              dep.depType === btcTimeLockDeps.depType,
-          );
-          if (!hasLatestBtcTimeLockDep) {
-            if (!btcTimeLockDeps.outPoint) {
-              throw new Error('BTC time lock cell dependency missing outPoint - cannot repair transaction');
-            }
-            ckbRawTx.cellDeps.unshift(btcTimeLockDeps, {
-              ...btcTimeLockDeps,
-              outPoint: { ...btcTimeLockDeps.outPoint, index: '0x1' },
-            } as CellDep);
-            btcTimeLockDepAdded = true;
-          }
-        }
+        const latestBtcTimeLockDepAdded = addLatestCellDepIfNeeded(
+          ckbRawTx,
+          latestCellDeps.btcTime[network],
+          btcTimeLockCellDepRequired,
+        );
 
         this.cradle.logger.debug(
-          `[TransactionProcessor] Cell deps status - RGB++ required: ${rgbppCellDepRequired}, added: ${rgbppDepAdded}, BTC TimeLock required: ${btcTimeLockCellDepRequired}, added: ${btcTimeLockDepAdded}`,
+          `[TransactionProcessor] Cell deps status - RGB++ required: ${rgbppCellDepRequired}, added: ${latestRgbppDepAdded}, BTC TimeLock required: ${btcTimeLockCellDepRequired}, added: ${latestBtcTimeLockDepAdded}`,
         );
       }
     } catch (error) {
