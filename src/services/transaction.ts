@@ -10,6 +10,7 @@ import {
   getSporeTypeDep,
   isClusterSporeTypeSupported,
   updateCkbTxWithRealBtcTxId,
+  fetchCellDepsJson,
 } from '@rgbpp-sdk/ckb';
 import {
   btcTxIdAndAfterFromBtcTimeLockArgs,
@@ -37,6 +38,7 @@ import BaseQueueWorker from './base/queue-worker';
 import { Env } from '../env';
 import { getCommitmentFromBtcTx } from '../utils/commitment';
 import { isBtcTimeLock, isRgbppLock } from '../utils/lockscript';
+import { addLatestCellDepIfNeeded } from '../utils/cell-deps';
 import { IS_MAINNET } from '../constants';
 
 export interface ITransactionRequest {
@@ -98,6 +100,7 @@ export default class TransactionProcessor
   private cradle: Cradle;
   private isRetryMissingTransactionsRunning = false;
   private limit: pLimit.Limit;
+  private deadCellMap = new Set<string>();
 
   constructor(cradle: Cradle) {
     const defaultJobOptions = TransactionProcessor.getDefaultJobOptions(cradle.env);
@@ -113,6 +116,8 @@ export default class TransactionProcessor
     });
     this.cradle = cradle;
     this.limit = pLimit(20); // Control concurrency to avoid overwhelming CKB RPC
+
+    this.initializeDeadCellCacheWithKnownDeadCells();
   }
 
   public static getDefaultJobOptions(env: Env) {
@@ -123,6 +128,25 @@ export default class TransactionProcessor
         delay: env.TRANSACTION_QUEUE_JOB_DELAY,
       },
     };
+  }
+
+  private initializeDeadCellCacheWithKnownDeadCells() {
+    this.cradle.env.KNOWN_DEAD_CELLS.forEach((cell) => {
+      const [txHash, index] = cell.split(':');
+
+      // validate txHash and index format
+      try {
+        if (!txHash.startsWith('0x') || txHash.length !== 66 || !index.startsWith('0x')) {
+          throw new Error('Invalid format');
+        }
+        BigInt(index); // validates hex integer
+      } catch {
+        this.cradle.logger.warn(`[TransactionProcessor] Invalid index in known dead cell: ${cell}`);
+        return;
+      }
+
+      this.deadCellMap.add(this.deadCellMapKey({ txHash, index }));
+    });
   }
 
   /**
@@ -522,6 +546,122 @@ export default class TransactionProcessor
     await this.moveJobToDelayed(job, token, err);
   }
 
+  private deadCellMapKey(outPoint: { txHash: string; index: string }) {
+    return `${outPoint.txHash}:${outPoint.index}`;
+  }
+
+  /**
+   * Repair transaction by filtering out known dead cell dependencies and adding required lock scripts cell deps
+   */
+  private async fixTransactionCellDependencies(job: Job<ITransactionRequest>, token?: string, err?: Error) {
+    this.cradle.logger.debug(`[TransactionProcessor] Fixing transaction cell dependencies: ${job.data.txid}`);
+    const { txid, ckbVirtualResult } = job.data;
+    const { ckbRawTx } = ckbVirtualResult;
+
+    // filter out known dead cells from cellDeps
+    let hasTargetDeadCellDeps = false;
+    const originalCellDepsCount = ckbRawTx.cellDeps.length;
+    ckbRawTx.cellDeps = ckbRawTx.cellDeps.filter((cellDep) => {
+      if (!cellDep.outPoint) {
+        return false;
+      }
+
+      const cellKey = this.deadCellMapKey(cellDep.outPoint);
+      if (this.deadCellMap.has(cellKey)) {
+        this.cradle.logger.debug(`[TransactionProcessor] Removed known dead cell dep: ${cellKey}`);
+        hasTargetDeadCellDeps = true;
+        return false;
+      }
+
+      return true;
+    });
+
+    this.cradle.logger.debug(
+      `[TransactionProcessor] Filtered cell deps, kept ${ckbRawTx.cellDeps.length}/${originalCellDepsCount} live cell deps`,
+    );
+
+    if (!hasTargetDeadCellDeps) {
+      // in this case, the problem goes beyond the capacity of this method to fix, the repair process stops right here
+      this.cradle.logger.debug(`[TransactionProcessor] No matched dead cell deps found`);
+      // throw the original error
+      throw err;
+    }
+
+    // add the latest RGB++ and BTC time lock cell deps as needed
+    try {
+      let rgbppCellDepRequired = false,
+        btcTimeLockCellDepRequired = false;
+
+      const inputs = await Promise.all(
+        ckbRawTx.inputs.map((input) => this.limit(() => this.cradle.ckb.rpc.getLiveCell(input.previousOutput!, false))),
+      );
+
+      // check which cell deps are needed
+      for (const input of inputs) {
+        if (input.status === 'live' && input.cell) {
+          const lock = input.cell.output.lock;
+          if (isRgbppLock(lock)) {
+            rgbppCellDepRequired = true;
+          } else if (isBtcTimeLock(lock)) {
+            btcTimeLockCellDepRequired = true;
+          }
+          // early exit if both are found
+          if (rgbppCellDepRequired && btcTimeLockCellDepRequired) {
+            break;
+          }
+        }
+      }
+
+      if (rgbppCellDepRequired || btcTimeLockCellDepRequired) {
+        let latestCellDeps: Awaited<ReturnType<typeof fetchCellDepsJson>>;
+        try {
+          latestCellDeps = await fetchCellDepsJson();
+        } catch (error) {
+          throw new Error(
+            `Unable to fetch required cell dependencies: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          );
+        }
+
+        if (!latestCellDeps) {
+          throw new Error('Cell dependencies fetch returned empty response - unable to repair transaction');
+        }
+
+        const network = IS_MAINNET ? 'mainnet' : 'testnet';
+        if (!latestCellDeps.rgbpp?.[network] || !latestCellDeps.btcTime?.[network]) {
+          throw new Error(`Missing ${network} cell dependencies configuration`);
+        }
+
+        const latestRgbppDepAdded = addLatestCellDepIfNeeded(
+          ckbRawTx,
+          latestCellDeps.rgbpp[network],
+          rgbppCellDepRequired,
+        );
+
+        const latestBtcTimeLockDepAdded = addLatestCellDepIfNeeded(
+          ckbRawTx,
+          latestCellDeps.btcTime[network],
+          btcTimeLockCellDepRequired,
+        );
+
+        this.cradle.logger.debug(
+          `[TransactionProcessor] Cell deps status - RGB++ required: ${rgbppCellDepRequired}, added: ${latestRgbppDepAdded}, BTC TimeLock required: ${btcTimeLockCellDepRequired}, added: ${latestBtcTimeLockDepAdded}`,
+        );
+      }
+    } catch (error) {
+      this.cradle.logger.warn(`[TransactionProcessor] Failed to add latest cell deps: ${error}`);
+    }
+
+    job.updateData({
+      txid,
+      ckbVirtualResult: {
+        ...ckbVirtualResult,
+        ckbRawTx,
+      },
+    });
+
+    await this.moveJobToDelayed(job, token, err);
+  }
+
   /**
    * Process the transaction request, called by the worker
    * - get the Bitcoin transaction
@@ -595,6 +735,28 @@ export default class TransactionProcessor
 
         // mark the paymaster cell as unspent if the transaction failed
         this.cradle.paymaster.markPaymasterCellAsUnspent(txid, signedTx!);
+
+        if (
+          err instanceof CKBRpcError &&
+          err.code === CKBRPCErrorCodes.TransactionFailedToResolve &&
+          err.message.includes('Unknown(OutPoint')
+        ) {
+          try {
+            await this.fixTransactionCellDependencies(job, token, err as Error);
+            return;
+          } catch (fixError) {
+            // check if it's a DelayedError (normal delay signal)
+            if (fixError instanceof DelayedError) {
+              // re-throw DelayedError to properly signal BullMQ
+              this.cradle.logger.debug(
+                `[TransactionProcessor] Successfully delayed the job after trying to fix cell dependencies`,
+              );
+              throw fixError;
+            }
+            // unfixed the error, continue the following process
+            this.cradle.logger.debug(`[TransactionProcessor] Failed to fix cell dependencies: ${fixError}`);
+          }
+        }
 
         // Check for permanent failures that should not be retried
         if (this.isPermanentError(err as Error)) {

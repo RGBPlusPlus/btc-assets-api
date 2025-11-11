@@ -225,6 +225,17 @@ const envSchema = z
      * The delay (in milliseconds) between processing block batches during RGB++ transaction retry
      */
     TRANSACTION_RETRY_BLOCK_BATCH_DELAY: z.coerce.number().default(1000),
+
+    /**
+     * The known dead cells map in format of txHash_with_0x_prefix:index_with_0x_prefix, separated by comma
+     */
+    KNOWN_DEAD_CELLS: z
+      .string()
+      .default(
+        '0xf1de59e973b85791ec32debbba08dff80c63197e895eb95d67fc1e9f6b413e00:0x0,0xf1de59e973b85791ec32debbba08dff80c63197e895eb95d67fc1e9f6b413e00:0x1,0xde0f87878a97500f549418e5d46d2f7704c565a262aa17036c9c1c13ad638529:0x0,0xde0f87878a97500f549418e5d46d2f7704c565a262aa17036c9c1c13ad638529:0x1',
+      )
+      .transform((value) => value.split(','))
+      .pipe(z.string().array()),
   })
   .and(
     z.union([
