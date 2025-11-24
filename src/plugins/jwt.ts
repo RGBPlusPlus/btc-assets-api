@@ -78,4 +78,23 @@ export default fp(async (fastify) => {
       reply.status(HttpStatusCode.Unauthorized).send(err);
     }
   });
+
+  // Log JWT info for error responses (4xx/5xx)
+  fastify.addHook('onResponse', async (request, reply) => {
+    if (reply.statusCode < HttpStatusCode.BadRequest) return;
+
+    const jwt = request.user as JwtPayload | undefined;
+    if (!jwt) return;
+
+    fastify.log.warn(
+      {
+        jti: jwt.jti,
+        app: jwt.sub,
+        domain: jwt.aud,
+        ip: request.ip,
+        statusCode: reply.statusCode,
+      },
+      `[JWT Trace] ${request.method} ${request.url}`,
+    );
+  });
 });
