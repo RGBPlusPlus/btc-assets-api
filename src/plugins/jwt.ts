@@ -8,7 +8,7 @@ import { HttpStatusCode } from 'axios';
 export interface JwtPayload {
   sub: string;
   aud: string;
-  jti: string;
+  jti?: string;
 }
 
 export default fp(async (fastify) => {
