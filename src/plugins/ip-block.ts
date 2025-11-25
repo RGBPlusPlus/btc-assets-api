@@ -2,6 +2,13 @@ import fp from 'fastify-plugin';
 import { HttpStatusCode } from 'axios';
 import { env } from '../env';
 
+// HTTP status codes that are logged for IP activity monitoring
+const SECURITY_LOG_STATUS_CODES = [
+  HttpStatusCode.Unauthorized,
+  HttpStatusCode.Forbidden,
+  HttpStatusCode.TooManyRequests,
+];
+
 export default fp(async (fastify) => {
   try {
     fastify.addHook('onRequest', async (request, reply) => {
@@ -17,10 +24,7 @@ export default fp(async (fastify) => {
     fastify.addHook('onResponse', async (request, reply) => {
       const statusCode = reply.statusCode;
 
-      // Only log security-related errors: 401, 403, 429
-      if (
-        ![HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden, HttpStatusCode.TooManyRequests].includes(statusCode)
-      ) {
+      if (!SECURITY_LOG_STATUS_CODES.includes(statusCode)) {
         return;
       }
 
