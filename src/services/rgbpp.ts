@@ -319,6 +319,12 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     const inputs = await this.cradle.ckb.getInputCellsByOutPoint(ckbTx.inputs.map((input) => input.previousOutput!));
     const lastTypeInputIndex = findLastIndex(inputs, (input) => !!input.cellOutput.type);
     const anyRgbppLockInput = inputs.some((input) => isRgbppLock(input.cellOutput.lock));
+    const anyRgbppLockOutput = ckbTx.outputs.some((output) => isRgbppLock(output.lock));
+
+    // At least one of inputs or outputs must contain rgbpp_lock
+    if (!anyRgbppLockInput && !anyRgbppLockOutput) {
+      return false;
+    }
 
     // When inputs contain rgbpp_lock, commitment is required and all rgbpp_lock inputs must match btc_tx.vin
     let btcTxCommitment: Buffer | null = null;
@@ -375,12 +381,6 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
       return false;
     });
     if (!allOutputsValid) {
-      return false;
-    }
-
-    // Check if the inputs or outputs contain at least one rgbpp_lock cell
-    const anyRgbppLockOutput = ckbTx.outputs.some((output) => isRgbppLock(output.lock));
-    if (!anyRgbppLockInput && !anyRgbppLockOutput) {
       return false;
     }
 
