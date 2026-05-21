@@ -328,14 +328,9 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     // Check if the transaction has rgbpp_lock in inputs or outputs
     // When includeOutputOnlyRgbpp is false (v1), require rgbpp_lock in inputs
     // When includeOutputOnlyRgbpp is true (v2), accept rgbpp_lock in inputs or outputs
-    if (includeOutputOnlyRgbpp) {
-      if (!anyRgbppLockInput && !anyRgbppLockOutput) {
-        return false;
-      }
-    } else {
-      if (!anyRgbppLockInput) {
-        return false;
-      }
+    const hasRgbpp = anyRgbppLockInput || (includeOutputOnlyRgbpp && anyRgbppLockOutput);
+    if (!hasRgbpp) {
+      return false;
     }
 
     // When inputs contain rgbpp_lock, commitment is required and all rgbpp_lock inputs must match btc_tx.vin

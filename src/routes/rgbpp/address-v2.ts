@@ -3,10 +3,9 @@ import { Server } from 'http';
 import validateBitcoinAddress from '../../utils/validators';
 import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { IsomorphicTransaction, Script } from './types';
-import { createGetIsomorphicTx } from './shared';
+import { createActivityHandler } from './shared';
 import z from 'zod';
 import { Transaction as BTCTransaction } from '../bitcoin/types';
-import { filterOutputsByTypeScript, getTypeScript } from '../../utils/typescript';
 
 const addressRoutesV2: FastifyPluginCallback<Record<never, never>, Server, ZodTypeProvider> = (fastify, _, done) => {
   fastify.addHook('preHandler', async (request) => {
@@ -18,7 +17,7 @@ const addressRoutesV2: FastifyPluginCallback<Record<never, never>, Server, ZodTy
   });
 
   // v2: include output-only rgbpp lock transactions
-  const getIsomorphicTx = createGetIsomorphicTx(fastify, true);
+  const handleActivity = createActivityHandler(fastify, true);
 
   fastify.get(
     '/:btc_address/activity',
@@ -72,66 +71,8 @@ const addressRoutesV2: FastifyPluginCallback<Record<never, never>, Server, ZodTy
     },
     async (request) => {
       const { btc_address } = request.params;
-      const { rgbpp_only, after_btc_txid } = request.query;
-      const typeScript = getTypeScript(request.query.type_script);
-
-      const btcTxs = await fastify.bitcoin.getAddressTxs({
-        address: btc_address,
-        after_txid: after_btc_txid,
-      });
-
-      let txs = await Promise.all(
-        btcTxs.map(async (btcTx) => {
-          const isomorphicTx = await getIsomorphicTx(btcTx);
-          const isRgbpp = isomorphicTx.ckbVirtualTx || isomorphicTx.ckbTx;
-          if (!isRgbpp) {
-            return {
-              btcTx,
-              isRgbpp: false,
-            } as const;
-          }
-
-          const inputs = isomorphicTx.ckbVirtualTx?.inputs || isomorphicTx.ckbTx?.inputs || [];
-          const outPoints = inputs
-            .map((input) => input.previousOutput)
-            .filter((op): op is NonNullable<typeof op> => op != null);
-          const inputCells = await fastify.ckb.getInputCellsByOutPoint(outPoints);
-          const inputCellOutputs = inputCells.map((cell) => cell.cellOutput);
-
-          const outputs = isomorphicTx.ckbVirtualTx?.outputs || isomorphicTx.ckbTx?.outputs || [];
-
-          return {
-            btcTx,
-            isRgbpp: true,
-            isomorphicTx: {
-              ...isomorphicTx,
-              inputs: inputCellOutputs,
-              outputs,
-            },
-          } as const;
-        }),
-      );
-
-      if (rgbpp_only === 'true') {
-        txs = txs.filter((tx) => tx.isRgbpp);
-      }
-
-      if (typeScript) {
-        txs = txs.filter((tx) => {
-          if (!tx.isRgbpp) {
-            return false;
-          }
-          const cells = [...tx.isomorphicTx.inputs, ...tx.isomorphicTx.outputs];
-          return filterOutputsByTypeScript(cells, typeScript).length > 0;
-        });
-      }
-
-      const cursor = btcTxs.length > 0 ? btcTxs[btcTxs.length - 1].txid : undefined;
-      return {
-        address: btc_address,
-        txs,
-        cursor,
-      };
+      const { rgbpp_only, after_btc_txid, type_script } = request.query;
+      return handleActivity({ btc_address, rgbpp_only, after_btc_txid, type_script });
     },
   );
 
