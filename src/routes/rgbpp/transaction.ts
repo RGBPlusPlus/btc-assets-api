@@ -69,7 +69,8 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
     '/:btc_txid',
     {
       schema: {
-        description: `Get the CKB transaction hash by BTC txid.`,
+        deprecated: true,
+        description: 'Use /rgbpp/v2/transaction/:btc_txid instead. Get the CKB transaction hash by BTC txid.',
         tags: ['RGB++'],
         params: z.object({
           btc_txid: z.string().length(64, 'should be a 64-character hex string'),

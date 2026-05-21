@@ -240,7 +240,7 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     return pairs;
   }
 
-  public async queryRgbppLockTxByBtcTx(btcTx: Transaction) {
+  public async queryRgbppLockTxByBtcTx(btcTx: Transaction, includeOutputOnlyRgbpp?: boolean) {
     // Only query the first RGBPP_TX_INPUTS_MAX_LENGTH transactions for performance reasons
     const maxRecords = `0x${RGBPP_TX_INPUTS_MAX_LENGTH.toString(16)}`;
     const batchRequest = this.cradle.ckb.rpc.createBatchRequest(
@@ -259,7 +259,7 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     for (const tx of transactions) {
       for (const indexerTx of tx.objects) {
         const ckbTx = await this.cradle.ckb.rpc.getTransaction(indexerTx.txHash);
-        const isIsomorphic = await this.isIsomorphicTx(btcTx, ckbTx.transaction);
+        const isIsomorphic = await this.isIsomorphicTx(btcTx, ckbTx.transaction, undefined, includeOutputOnlyRgbpp);
         if (isIsomorphic) {
           return indexerTx;
         }
@@ -312,6 +312,7 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     btcTx: Transaction,
     ckbTx: CKBComponents.RawTransaction,
     validateCommitment?: boolean,
+    includeOutputOnlyRgbpp?: boolean,
   ): Promise<boolean> {
     // Check inputs:
     // 1. Find the last index of the type inputs
@@ -321,9 +322,17 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     const anyRgbppLockInput = inputs.some((input) => isRgbppLock(input.cellOutput.lock));
     const anyRgbppLockOutput = ckbTx.outputs.some((output) => isRgbppLock(output.lock));
 
-    // At least one of inputs or outputs must contain rgbpp_lock
-    if (!anyRgbppLockInput && !anyRgbppLockOutput) {
-      return false;
+    // Check if the transaction has rgbpp_lock in inputs or outputs
+    // When includeOutputOnlyRgbpp is false (v1), require rgbpp_lock in inputs
+    // When includeOutputOnlyRgbpp is true (v2), accept rgbpp_lock in inputs or outputs
+    if (includeOutputOnlyRgbpp) {
+      if (!anyRgbppLockInput && !anyRgbppLockOutput) {
+        return false;
+      }
+    } else {
+      if (!anyRgbppLockInput) {
+        return false;
+      }
     }
 
     // When inputs contain rgbpp_lock, commitment is required and all rgbpp_lock inputs must match btc_tx.vin
