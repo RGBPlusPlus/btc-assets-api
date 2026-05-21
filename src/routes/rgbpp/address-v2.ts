@@ -5,9 +5,8 @@ import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { IsomorphicTransaction, Script } from './types';
 import { createGetIsomorphicTx } from './shared';
 import z from 'zod';
-import { isScriptEqual } from '@rgbpp-sdk/ckb';
 import { Transaction as BTCTransaction } from '../bitcoin/types';
-import { getTypeScript } from '../../utils/typescript';
+import { filterOutputsByTypeScript, getTypeScript } from '../../utils/typescript';
 
 const addressRoutesV2: FastifyPluginCallback<Record<never, never>, Server, ZodTypeProvider> = (fastify, _, done) => {
   fastify.addHook('preHandler', async (request) => {
@@ -93,7 +92,10 @@ const addressRoutesV2: FastifyPluginCallback<Record<never, never>, Server, ZodTy
           }
 
           const inputs = isomorphicTx.ckbVirtualTx?.inputs || isomorphicTx.ckbTx?.inputs || [];
-          const inputCells = await fastify.ckb.getInputCellsByOutPoint(inputs.map((input) => input.previousOutput!));
+          const outPoints = inputs
+            .map((input) => input.previousOutput)
+            .filter((op): op is NonNullable<typeof op> => op != null);
+          const inputCells = await fastify.ckb.getInputCellsByOutPoint(outPoints);
           const inputCellOutputs = inputCells.map((cell) => cell.cellOutput);
 
           const outputs = isomorphicTx.ckbVirtualTx?.outputs || isomorphicTx.ckbTx?.outputs || [];
@@ -120,15 +122,7 @@ const addressRoutesV2: FastifyPluginCallback<Record<never, never>, Server, ZodTy
             return false;
           }
           const cells = [...tx.isomorphicTx.inputs, ...tx.isomorphicTx.outputs];
-          const filteredCells = cells.filter((cell) => {
-            if (!cell.type) return false;
-            if (!typeScript.args) {
-              const script = { ...cell.type, args: '' };
-              return isScriptEqual(script, typeScript);
-            }
-            return isScriptEqual(cell.type, typeScript);
-          });
-          return filteredCells.length > 0;
+          return filterOutputsByTypeScript(cells, typeScript).length > 0;
         });
       }
 

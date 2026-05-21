@@ -317,7 +317,10 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     // Check inputs:
     // 1. Find the last index of the type inputs
     // 2. Check if all rgbpp_lock inputs can be found in the btc_tx.vin (regardless the position)
-    const inputs = await this.cradle.ckb.getInputCellsByOutPoint(ckbTx.inputs.map((input) => input.previousOutput!));
+    const outPoints = ckbTx.inputs
+      .map((input) => input.previousOutput)
+      .filter((op): op is NonNullable<typeof op> => op != null);
+    const inputs = await this.cradle.ckb.getInputCellsByOutPoint(outPoints);
     const lastTypeInputIndex = findLastIndex(inputs, (input) => !!input.cellOutput.type);
     const anyRgbppLockInput = inputs.some((input) => isRgbppLock(input.cellOutput.lock));
     const anyRgbppLockOutput = ckbTx.outputs.some((output) => isRgbppLock(output.lock));

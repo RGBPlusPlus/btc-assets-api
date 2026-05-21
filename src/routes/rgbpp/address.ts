@@ -7,7 +7,6 @@ import { createGetIsomorphicTx } from './shared';
 import z from 'zod';
 import { Env } from '../../env';
 import {
-  isScriptEqual,
   buildPreLockArgs,
   getXudtTypeScript,
   isTypeAssetSupported,
@@ -20,7 +19,7 @@ import { UTXO } from '../../services/bitcoin/schema';
 import { Transaction as BTCTransaction } from '../bitcoin/types';
 
 import { computeScriptHash } from '@ckb-lumos/lumos/utils';
-import { filterCellsByTypeScript, getTypeScript } from '../../utils/typescript';
+import { filterCellsByTypeScript, filterOutputsByTypeScript, getTypeScript } from '../../utils/typescript';
 import { remove0x } from '@rgbpp-sdk/btc';
 import { isRgbppLock } from '../../utils/lockscript';
 import { IS_MAINNET } from '../../constants';
@@ -351,7 +350,10 @@ const addressRoutes: FastifyPluginCallback<Record<never, never>, Server, ZodType
           }
 
           const inputs = isomorphicTx.ckbVirtualTx?.inputs || isomorphicTx.ckbTx?.inputs || [];
-          const inputCells = await fastify.ckb.getInputCellsByOutPoint(inputs.map((input) => input.previousOutput!));
+          const outPoints = inputs
+            .map((input) => input.previousOutput)
+            .filter((op): op is NonNullable<typeof op> => op != null);
+          const inputCells = await fastify.ckb.getInputCellsByOutPoint(outPoints);
           const inputCellOutputs = inputCells.map((cell) => cell.cellOutput);
 
           const outputs = isomorphicTx.ckbVirtualTx?.outputs || isomorphicTx.ckbTx?.outputs || [];
@@ -378,15 +380,7 @@ const addressRoutes: FastifyPluginCallback<Record<never, never>, Server, ZodType
             return false;
           }
           const cells = [...tx.isomorphicTx.inputs, ...tx.isomorphicTx.outputs];
-          const filteredCells = cells.filter((cell) => {
-            if (!cell.type) return false;
-            if (!typeScript.args) {
-              const script = { ...cell.type, args: '' };
-              return isScriptEqual(script, typeScript);
-            }
-            return isScriptEqual(cell.type, typeScript);
-          });
-          return filteredCells.length > 0;
+          return filterOutputsByTypeScript(cells, typeScript).length > 0;
         });
       }
 
