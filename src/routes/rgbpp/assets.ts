@@ -176,8 +176,8 @@ const assetsRoute: FastifyPluginCallback<Record<never, never>, Server, ZodTypePr
         };
         if (sporeData.clusterId) {
           const sporeConfig = getSporeConfig(IS_MAINNET);
-          const batchRequest = fastify.ckb.rpc.createBatchRequest(
-            sporeConfig.scripts.Cluster.versions.map((version) => {
+          const cells: { objects: IndexerCell[] }[] = await fastify.ckb.caller.batch((b) => {
+            sporeConfig.scripts.Cluster.versions.forEach((version) => {
               const clusterScript = {
                 ...version.script,
                 args: sporeData.clusterId!,
@@ -187,10 +187,9 @@ const assetsRoute: FastifyPluginCallback<Record<never, never>, Server, ZodTypePr
                 scriptType: 'type',
                 withData: true,
               };
-              return ['getCells', searchKey, 'desc', '0x1'];
-            }),
-          );
-          const cells = await batchRequest.exec();
+              b.add('getCells', searchKey, 'desc', '0x1');
+            });
+          });
           const [cell] = cells.map(({ objects }: { objects: IndexerCell[] }) => objects).flat();
           const clusterData = unpackToRawClusterData(cell.outputData!);
           sporeInfo.cluster = {

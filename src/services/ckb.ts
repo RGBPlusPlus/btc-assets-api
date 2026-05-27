@@ -11,6 +11,7 @@ import { Cradle } from '../container';
 import { BI, Indexer, RPC, Script } from '@ckb-lumos/lumos';
 import { CKBRPC } from '@ckb-lumos/rpc';
 import { UngroupedIndexerTransaction } from '@ckb-lumos/ckb-indexer/lib/type';
+import { CkbRpcCaller } from './ckb-rpc-caller';
 import { z } from 'zod';
 import * as Sentry from '@sentry/node';
 import {
@@ -160,11 +161,13 @@ type TokenInfoMetadata = {
 export default class CKBClient {
   public rpc: RPC;
   public indexer: Indexer;
+  public caller: CkbRpcCaller;
   private dataCache: DataCache<unknown>;
 
   constructor(private cradle: Cradle) {
-    this.rpc = new RPC(cradle.env.CKB_RPC_URL);
-    this.indexer = new Indexer(cradle.env.CKB_RPC_URL);
+    this.caller = new CkbRpcCaller(cradle.env.CKB_RPC_URL);
+    this.rpc = this.caller.rpc;
+    this.indexer = this.caller.indexer;
     this.dataCache = new DataCache(cradle.redis, {
       prefix: 'ckb-info-cell-txs',
       expire: 10 * 60 * 1000,
@@ -301,53 +304,53 @@ export default class CKBClient {
     }
 
     const scripts = this.getScripts();
-    let batchRequest = this.rpc.createBatchRequest();
+    type getTransactionsResult = ReturnType<typeof this.rpc.getTransactions<false>>;
 
     // info cell script could be unique cell or inscription cell
-    [scripts.UNIQUE, scripts.INSCRIPTION].forEach((script) => {
-      const searchScript = { ...script, args: '0x' };
-      batchRequest.add(
-        'getTransactions',
-        {
-          script: searchScript,
-          scriptType: 'type',
-        },
-        // XXX: The returned result is not asc-ordered, maybe it is a bug in ckb-indexer
-        'asc',
-        // TODO: There may be a maximum request limit.
-        '0xffff', // 0xffff basically means no limit
-      );
+    const infoCellTxs: Awaited<getTransactionsResult>[] = await this.caller.batch((b) => {
+      [scripts.UNIQUE, scripts.INSCRIPTION].forEach((script) => {
+        const searchScript = { ...script, args: '0x' };
+        b.add(
+          'getTransactions',
+          {
+            script: searchScript,
+            scriptType: 'type',
+          },
+          // XXX: The returned result is not asc-ordered, maybe it is a bug in ckb-indexer
+          'asc',
+          // TODO: There may be a maximum request limit.
+          '0xffff', // 0xffff basically means no limit
+        );
+      });
     });
-    type getTransactionsResult = ReturnType<typeof this.rpc.getTransactions<false>>;
-    const infoCellTxs: Awaited<getTransactionsResult>[] = await batchRequest.exec();
     const allIndexerTxs = infoCellTxs.reduce(
       (acc, txs) => acc.concat(txs.objects.filter(({ ioType }: UngroupedIndexerTransaction) => ioType === 'output')),
       [] as UngroupedIndexerTransaction[],
     );
 
     // get all transactions that have the xudt type cell and info cell
-    batchRequest = this.rpc.createBatchRequest();
-    allIndexerTxs
-      .sort((txA: UngroupedIndexerTransaction, txB: UngroupedIndexerTransaction) => {
-        // make sure `infoCellTxs` are asc-ordered
-        // related issue: https://github.com/nervosnetwork/ckb/issues/4549
-        const aBlockNumber = BI.from(txA.blockNumber).toNumber();
-        const bBlockNumber = BI.from(txB.blockNumber).toNumber();
-        if (aBlockNumber < bBlockNumber) return -1;
-        else if (aBlockNumber > bBlockNumber) return 1;
-        else if (aBlockNumber === bBlockNumber) {
-          const aTxIndex = BI.from(txA.txIndex).toNumber();
-          const bTxIndex = BI.from(txB.txIndex).toNumber();
-          if (aTxIndex < bTxIndex) return -1;
-          else if (aTxIndex > bTxIndex) return 1;
-        }
-        // unreachable: aBlockNumber === bBlockNumber && aTxIndex === bTxIndex
-        return 0;
-      })
-      .forEach((tx: UngroupedIndexerTransaction) => {
-        batchRequest.add('getTransaction', tx.txHash);
-      });
-    const txs: TransactionWithStatus[] = await batchRequest.exec();
+    const txs: TransactionWithStatus[] = await this.caller.batch((b) => {
+      allIndexerTxs
+        .sort((txA: UngroupedIndexerTransaction, txB: UngroupedIndexerTransaction) => {
+          // make sure `infoCellTxs` are asc-ordered
+          // related issue: https://github.com/nervosnetwork/ckb/issues/4549
+          const aBlockNumber = BI.from(txA.blockNumber).toNumber();
+          const bBlockNumber = BI.from(txB.blockNumber).toNumber();
+          if (aBlockNumber < bBlockNumber) return -1;
+          else if (aBlockNumber > bBlockNumber) return 1;
+          else if (aBlockNumber === bBlockNumber) {
+            const aTxIndex = BI.from(txA.txIndex).toNumber();
+            const bTxIndex = BI.from(txB.txIndex).toNumber();
+            if (aTxIndex < bTxIndex) return -1;
+            else if (aTxIndex > bTxIndex) return 1;
+          }
+          // unreachable: aBlockNumber === bBlockNumber && aTxIndex === bTxIndex
+          return 0;
+        })
+        .forEach((tx: UngroupedIndexerTransaction) => {
+          b.add('getTransaction', tx.txHash);
+        });
+    });
     await this.dataCache.set('all', txs);
     return txs;
   }
@@ -413,8 +416,9 @@ export default class CKBClient {
 
   public async getInputCellsByOutPoint(outPoints: CKBComponents.OutPoint[]): Promise<Cell[]> {
     const txHashes = uniq(outPoints.map((outPoint) => outPoint.txHash));
-    const batchRequest = this.rpc.createBatchRequest(txHashes.map((txHash) => ['getTransaction', txHash]));
-    const txs: TransactionWithStatus[] = await batchRequest.exec();
+    const txs: TransactionWithStatus[] = await this.caller.batch((b) => {
+      txHashes.forEach((txHash) => b.add('getTransaction', txHash));
+    });
     const txsMap = txs.reduce(
       (acc, tx: TransactionWithStatus) => {
         acc[tx.transaction.hash] = tx;
