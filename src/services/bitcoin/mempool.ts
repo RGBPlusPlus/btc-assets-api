@@ -12,11 +12,13 @@ export class MempoolClient implements IBitcoinDataProvider {
   constructor(
     private baseURL: string,
     cradle: Cradle,
+    timeoutMs?: number,
   ) {
     const url = new URL(baseURL);
     this.mempool = mempoolJS({
       hostname: url.hostname,
       network: cradle.env.NETWORK,
+      config: timeoutMs ? { timeout: timeoutMs } : undefined,
     });
   }
 

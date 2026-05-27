@@ -52,6 +52,7 @@ export default class SPVClient {
     this.cradle = cradle;
     this.request = axios.create({
       baseURL: env.BITCOIN_SPV_SERVICE_URL,
+      timeout: env.BITCOIN_SPV_TIMEOUT_MS,
     });
     addLoggerInterceptor(this.request, logger);
   }

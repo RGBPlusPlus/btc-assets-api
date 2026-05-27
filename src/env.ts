@@ -105,6 +105,21 @@ const envSchema = z
     BITCOIN_RPC_MAX_CONCURRENCY: z.coerce.number().default(50),
 
     /**
+     * Per-request HTTP timeout (ms) for Bitcoin data providers (Electrs / Mempool).
+     * Bounds how long any single RPC call holds a concurrency slot.
+     * Primary timeout triggers BitcoinClient.call() to switch to fallback;
+     * worst-case end-to-end is roughly 2x this value.
+     */
+    BITCOIN_HTTP_TIMEOUT_MS: z.coerce.number().default(10_000),
+
+    /**
+     * Per-request HTTP timeout (ms) for the Bitcoin SPV service.
+     * Independent from BITCOIN_HTTP_TIMEOUT_MS because the SPV proof workload
+     * has a different latency profile (proof generation, reorg handling).
+     */
+    BITCOIN_SPV_TIMEOUT_MS: z.coerce.number().default(10_000),
+
+    /**
      * The URL of the CKB JSON-RPC server.
      */
     CKB_RPC_URL: z.string(),
