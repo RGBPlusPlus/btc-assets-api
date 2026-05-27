@@ -270,27 +270,24 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
 
   public async queryBtcTimeLockTxByBtcTx(btcTx: Transaction) {
     const rgbppLock = getRgbppLock();
-    const relatedCkbTxs = (
-      await Promise.all(
-        btcTx.vin.map(({ txid, vout }) => {
-          const args = buildRgbppLockArgs(vout, txid);
-          return this.cradle.ckb.rpc.getTransactions(
-            {
-              script: {
-                ...rgbppLock,
-                args,
-              },
-              scriptType: 'lock',
-              groupByTransaction: true,
-            },
-            'asc',
-            '0x64',
-          );
-        }),
-      )
-    )
-      .map(({ objects }) => objects)
-      .flat();
+    // Use a single JSON-RPC batch instead of fan-out: N HTTP round-trips → 1.
+    const batchRequest = this.cradle.ckb.rpc.createBatchRequest(
+      btcTx.vin.map(({ txid, vout }) => {
+        const args = buildRgbppLockArgs(vout, txid);
+        const searchKey = {
+          script: {
+            ...rgbppLock,
+            args,
+          },
+          scriptType: 'lock' as const,
+          groupByTransaction: true,
+        };
+        return ['getTransactions', searchKey, 'asc', '0x64'];
+      }),
+    );
+    type getTransactionsResult = ReturnType<typeof this.cradle.ckb.rpc.getTransactions<true>>;
+    const transactions: Awaited<getTransactionsResult>[] = await batchRequest.exec();
+    const relatedCkbTxs = transactions.flatMap(({ objects }) => objects);
 
     for (const tx of relatedCkbTxs) {
       const ckbTx = await this.cradle.ckb.rpc.getTransaction(tx.txHash);
