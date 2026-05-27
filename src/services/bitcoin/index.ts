@@ -68,21 +68,22 @@ export default class BitcoinClient implements IBitcoinClient {
     this.limit = pLimit(cradle.env.BITCOIN_RPC_MAX_CONCURRENCY);
 
     const { env } = cradle;
+    const timeoutMs = env.BITCOIN_HTTP_TIMEOUT_MS;
     switch (env.BITCOIN_DATA_PROVIDER) {
       case 'mempool':
         this.cradle.logger.info('Using Mempool.space API as the bitcoin data provider');
-        this.source = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle);
+        this.source = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle, timeoutMs);
         if (env.BITCOIN_ELECTRS_API_URL) {
           this.cradle.logger.info('Using Electrs API as the fallback bitcoin data provider');
-          this.fallback = new ElectrsClient(env.BITCOIN_ELECTRS_API_URL);
+          this.fallback = new ElectrsClient(env.BITCOIN_ELECTRS_API_URL, timeoutMs);
         }
         break;
       case 'electrs':
         this.cradle.logger.info('Using Electrs API as the bitcoin data provider');
-        this.source = new ElectrsClient(env.BITCOIN_ELECTRS_API_URL);
+        this.source = new ElectrsClient(env.BITCOIN_ELECTRS_API_URL, timeoutMs);
         if (env.BITCOIN_MEMPOOL_SPACE_API_URL) {
           this.cradle.logger.info('Using Mempool.space API as the fallback bitcoin data provider');
-          this.fallback = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle);
+          this.fallback = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle, timeoutMs);
         }
         break;
       default:
@@ -96,7 +97,9 @@ export default class BitcoinClient implements IBitcoinClient {
       env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST &&
       env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST.length > 0
     ) {
-      const additionalElectrs = env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST.map((url) => new ElectrsClient(url));
+      const additionalElectrs = env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST.map(
+        (url) => new ElectrsClient(url, timeoutMs),
+      );
       this.backupers.push(...additionalElectrs);
     }
   }

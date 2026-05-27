@@ -5,6 +5,9 @@ import Paymaster from '../services/paymaster';
 import axios from 'axios';
 import { Env } from '../env';
 
+// Aggressive timeout for liveness probes so a hung upstream fails fast
+const HEALTHCHECK_TIMEOUT_MS = 5_000;
+
 export default fp(async (fastify) => {
   const env: Env = fastify.container.resolve('env');
   await fastify.register(healthcheck, {
@@ -22,11 +25,15 @@ export default fp(async (fastify) => {
     // NETWORK: z.enum(['mainnet', 'testnet', 'signet']).default('testnet')
     const networkPath = env.NETWORK === 'mainnet' ? '' : `/${env.NETWORK}`;
 
-    await axios.get(`${env.BITCOIN_MEMPOOL_SPACE_API_URL}${networkPath}/api/blocks/tip/height`);
+    await axios.get(`${env.BITCOIN_MEMPOOL_SPACE_API_URL}${networkPath}/api/blocks/tip/height`, {
+      timeout: HEALTHCHECK_TIMEOUT_MS,
+    });
   });
 
   fastify.addHealthCheck('electrs', async () => {
-    await axios.get(`${env.BITCOIN_ELECTRS_API_URL}/blocks/tip/height`);
+    await axios.get(`${env.BITCOIN_ELECTRS_API_URL}/blocks/tip/height`, {
+      timeout: HEALTHCHECK_TIMEOUT_MS,
+    });
   });
 
   fastify.addHealthCheck('queue', async () => {

@@ -5,9 +5,13 @@ import { Block, RecommendedFees, Transaction, UTXO } from './schema';
 export class ElectrsClient implements IBitcoinDataProvider {
   private request: AxiosInstance;
 
-  constructor(private baseURL: string) {
+  constructor(
+    private baseURL: string,
+    timeoutMs?: number,
+  ) {
     this.request = axios.create({
       baseURL,
+      timeout: timeoutMs,
     });
   }
 
