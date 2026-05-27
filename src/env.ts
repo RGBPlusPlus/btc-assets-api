@@ -92,6 +92,13 @@ const envSchema = z
       .optional(),
 
     /**
+     * The async concurrency size limit for Bitcoin RPC requests.
+     * All calls routed through BitcoinClient.call() (primary + fallback) share this limit.
+     * The fire-and-forget backup broadcast in postTx() bypasses this limit by design.
+     */
+    BITCOIN_RPC_MAX_CONCURRENCY: z.coerce.number().default(50),
+
+    /**
      * The URL of the CKB JSON-RPC server.
      */
     CKB_RPC_URL: z.string(),
