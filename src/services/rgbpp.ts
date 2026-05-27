@@ -240,7 +240,7 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     return pairs;
   }
 
-  public async queryRgbppLockTxByBtcTx(btcTx: Transaction) {
+  public async queryRgbppLockTxByBtcTx(btcTx: Transaction, includeOutputOnlyRgbpp?: boolean) {
     // Only query the first RGBPP_TX_INPUTS_MAX_LENGTH transactions for performance reasons
     const maxRecords = `0x${RGBPP_TX_INPUTS_MAX_LENGTH.toString(16)}`;
     const batchRequest = this.cradle.ckb.rpc.createBatchRequest(
@@ -259,7 +259,7 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     for (const tx of transactions) {
       for (const indexerTx of tx.objects) {
         const ckbTx = await this.cradle.ckb.rpc.getTransaction(indexerTx.txHash);
-        const isIsomorphic = await this.isIsomorphicTx(btcTx, ckbTx.transaction);
+        const isIsomorphic = await this.isIsomorphicTx(btcTx, ckbTx.transaction, undefined, includeOutputOnlyRgbpp);
         if (isIsomorphic) {
           return indexerTx;
         }
@@ -312,45 +312,58 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
     btcTx: Transaction,
     ckbTx: CKBComponents.RawTransaction,
     validateCommitment?: boolean,
+    includeOutputOnlyRgbpp?: boolean,
   ): Promise<boolean> {
-    // Find the commitment from the btc_tx
-    const btcTxCommitment = tryGetCommitmentFromBtcTx(btcTx);
-    if (!btcTxCommitment) {
-      return false;
-    }
-
     // Check inputs:
     // 1. Find the last index of the type inputs
     // 2. Check if all rgbpp_lock inputs can be found in the btc_tx.vin (regardless the position)
-    // 3. Check if the inputs contain at least one rgbpp_lock cell (as L1-L1 and L1-L2 transactions should have)
-    const inputs = await this.cradle.ckb.getInputCellsByOutPoint(ckbTx.inputs.map((input) => input.previousOutput!));
+    const outPoints = ckbTx.inputs
+      .map((input) => input.previousOutput)
+      .filter((op): op is NonNullable<typeof op> => op != null);
+    const inputs = await this.cradle.ckb.getInputCellsByOutPoint(outPoints);
     const lastTypeInputIndex = findLastIndex(inputs, (input) => !!input.cellOutput.type);
     const anyRgbppLockInput = inputs.some((input) => isRgbppLock(input.cellOutput.lock));
-    if (!anyRgbppLockInput) {
+    const anyRgbppLockOutput = ckbTx.outputs.some((output) => isRgbppLock(output.lock));
+
+    // Check if the transaction has rgbpp_lock in inputs or outputs
+    // When includeOutputOnlyRgbpp is false (v1), require rgbpp_lock in inputs
+    // When includeOutputOnlyRgbpp is true (v2), accept rgbpp_lock in inputs or outputs
+    const hasRgbpp = anyRgbppLockInput || (includeOutputOnlyRgbpp && anyRgbppLockOutput);
+    if (!hasRgbpp) {
       return false;
     }
-    const allInputsValid = inputs.every((input) => {
-      if (!input.cellOutput.type) {
-        return true;
+
+    // When inputs contain rgbpp_lock, commitment is required and all rgbpp_lock inputs must match btc_tx.vin
+    let btcTxCommitment: Buffer | null = null;
+    if (anyRgbppLockInput) {
+      btcTxCommitment = tryGetCommitmentFromBtcTx(btcTx);
+      if (!btcTxCommitment) {
+        return false;
       }
-      if (!isRgbppLock(input.cellOutput.lock)) {
-        return true;
+
+      const allInputsValid = inputs.every((input) => {
+        if (!input.cellOutput.type) {
+          return true;
+        }
+        if (!isRgbppLock(input.cellOutput.lock)) {
+          return true;
+        }
+        const rgbppLockArgs = unpackRgbppLockArgs(input.cellOutput.lock.args);
+        const matchingBtcInput = btcTx.vin.find(
+          (btcInput) => btcInput.txid === remove0x(rgbppLockArgs.btcTxId) && btcInput.vout === rgbppLockArgs.outIndex,
+        );
+        return !!matchingBtcInput;
+      });
+      if (!allInputsValid) {
+        return false;
       }
-      const rgbppLockArgs = unpackRgbppLockArgs(input.cellOutput.lock.args);
-      const matchingBtcInput = btcTx.vin.find(
-        (btcInput) => btcInput.txid === remove0x(rgbppLockArgs.btcTxId) && btcInput.vout === rgbppLockArgs.outIndex,
-      );
-      return !!matchingBtcInput;
-    });
-    if (!allInputsValid) {
-      return false;
     }
 
     // Check outputs:
     // 1. Find the last index of the type outputs
     // 2. Check if all type outputs are rgbpp_lock or btc_time_lock cells
-    // 4. Check if each rgbpp_lock cell has an isomorphic UTXO in the btc_tx.vout
-    // 5. Check if each btc_time_lock cell contains the corresponding btc_txid in the lock args
+    // 3. Check if each rgbpp_lock cell has an isomorphic UTXO in the btc_tx.vout
+    // 4. Check if each btc_time_lock cell contains the corresponding btc_txid in the lock args
     const lastTypeOutputIndex = findLastIndex(ckbTx.outputs, (output) => !!output.type);
     const allOutputsValid = ckbTx.outputs.every((output) => {
       if (!output.type) {
@@ -378,12 +391,13 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
       return false;
     }
 
-    // Compare commitment between btc_tx and ckb_tx
-    if (!validateCommitment) {
-      return true;
+    // Compare commitment between btc_tx and ckb_tx (only applicable when inputs have rgbpp_lock)
+    if (anyRgbppLockInput && validateCommitment && btcTxCommitment) {
+      const btcTxCommitmentHex = btcTxCommitment.toString('hex');
+      return isCommitmentMatchToCkbTx(btcTxCommitmentHex, ckbTx, lastTypeInputIndex, lastTypeOutputIndex);
     }
-    const btcTxCommitmentHex = btcTxCommitment.toString('hex');
-    return isCommitmentMatchToCkbTx(btcTxCommitmentHex, ckbTx, lastTypeInputIndex, lastTypeOutputIndex);
+
+    return true;
   }
 
   /**

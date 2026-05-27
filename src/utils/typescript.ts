@@ -41,3 +41,19 @@ export function filterCellsByTypeScript(cells: Cell[], typeScript: Script) {
     return isScriptEqual(cell.cellOutput.type, typeScript);
   });
 }
+
+/**
+ * Filter cell outputs by type script
+ */
+export function filterOutputsByTypeScript(outputs: CKBComponents.CellOutput[], typeScript: Script) {
+  return outputs.filter((output) => {
+    if (!output.type) {
+      return false;
+    }
+    if (!typeScript.args) {
+      const script = { ...output.type, args: '' };
+      return isScriptEqual(script, typeScript);
+    }
+    return isScriptEqual(output.type, typeScript);
+  });
+}

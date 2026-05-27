@@ -16,6 +16,7 @@ import { serializerCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
 import cors from './plugins/cors';
 import { NetworkType } from './constants';
 import rgbppRoutes from './routes/rgbpp';
+import rgbppRoutesV2 from './routes/rgbpp/index-v2';
 import cronRoutes from './routes/cron';
 import { provider } from 'std-env';
 import ipBlock from './plugins/ip-block';
@@ -46,6 +47,7 @@ async function routes(fastify: FastifyInstance) {
   fastify.register(tokenRoutes, { prefix: '/token' });
   fastify.register(bitcoinRoutes, { prefix: '/bitcoin/v1' });
   fastify.register(rgbppRoutes, { prefix: '/rgbpp/v1' });
+  fastify.register(rgbppRoutesV2, { prefix: '/rgbpp/v2' });
 
   // register cron routes only on Vercel
   if (provider === 'vercel' || env.NODE_ENV === 'test') {
