@@ -120,8 +120,24 @@ const envSchema = z
 
     /**
      * The async concurrency size limit for CKB RPC requests.
+     * All calls (HTTP entry + BullMQ workers) routed through CkbRpcCaller share this pool.
      */
     CKB_RPC_MAX_CONCURRENCY: z.coerce.number().default(100),
+
+    /**
+     * Maximum number of sub-requests in a single JSON-RPC batch.
+     * CkbRpcCaller.batch() auto-splits oversized batches into chunks of this size;
+     * each chunk consumes one CKB_RPC_MAX_CONCURRENCY slot. Prevents a single
+     * mega-batch (e.g. thousands of getTransaction) from monopolizing the node.
+     */
+    CKB_RPC_BATCH_MAX_SIZE: z.coerce.number().default(150),
+
+    /**
+     * Per-request HTTP timeout (ms) for CKB JSON-RPC calls (single + batch).
+     * Bounds how long any single RPC call holds a concurrency slot.
+     */
+    CKB_HTTP_TIMEOUT_MS: z.coerce.number().default(15_000),
+
     /**
      * Paymaster private key, used to sign the transaction with paymaster cell.
      */
