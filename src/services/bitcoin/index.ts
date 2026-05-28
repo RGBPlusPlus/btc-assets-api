@@ -2,6 +2,7 @@
 /* eslint-disable @typescript-eslint/ban-types */
 import { HttpStatusCode, isAxiosError } from 'axios';
 import * as Sentry from '@sentry/node';
+import pLimit from 'p-limit';
 import { Cradle } from '../../container';
 import { IBitcoinBroadcastBackuper, IBitcoinDataProvider } from './interface';
 import { MempoolClient } from './mempool';
@@ -60,26 +61,29 @@ export default class BitcoinClient implements IBitcoinClient {
   private source: IBitcoinDataProvider;
   private fallback?: IBitcoinDataProvider;
   private backupers: IBitcoinBroadcastBackuper[] = [];
+  private limit: pLimit.Limit;
 
   constructor(cradle: Cradle) {
     this.cradle = cradle;
+    this.limit = pLimit(cradle.env.BITCOIN_RPC_MAX_CONCURRENCY);
 
     const { env } = cradle;
+    const timeoutMs = env.BITCOIN_HTTP_TIMEOUT_MS;
     switch (env.BITCOIN_DATA_PROVIDER) {
       case 'mempool':
         this.cradle.logger.info('Using Mempool.space API as the bitcoin data provider');
-        this.source = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle);
+        this.source = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle, timeoutMs);
         if (env.BITCOIN_ELECTRS_API_URL) {
           this.cradle.logger.info('Using Electrs API as the fallback bitcoin data provider');
-          this.fallback = new ElectrsClient(env.BITCOIN_ELECTRS_API_URL);
+          this.fallback = new ElectrsClient(env.BITCOIN_ELECTRS_API_URL, timeoutMs);
         }
         break;
       case 'electrs':
         this.cradle.logger.info('Using Electrs API as the bitcoin data provider');
-        this.source = new ElectrsClient(env.BITCOIN_ELECTRS_API_URL);
+        this.source = new ElectrsClient(env.BITCOIN_ELECTRS_API_URL, timeoutMs);
         if (env.BITCOIN_MEMPOOL_SPACE_API_URL) {
           this.cradle.logger.info('Using Mempool.space API as the fallback bitcoin data provider');
-          this.fallback = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle);
+          this.fallback = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle, timeoutMs);
         }
         break;
       default:
@@ -93,7 +97,9 @@ export default class BitcoinClient implements IBitcoinClient {
       env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST &&
       env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST.length > 0
     ) {
-      const additionalElectrs = env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST.map((url) => new ElectrsClient(url));
+      const additionalElectrs = env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST.map(
+        (url) => new ElectrsClient(url, timeoutMs),
+      );
       this.backupers.push(...additionalElectrs);
     }
   }
@@ -102,56 +108,60 @@ export default class BitcoinClient implements IBitcoinClient {
     method: K,
     ...args: MethodParameters<IBitcoinDataProvider, K>
   ): Promise<MethodReturnType<IBitcoinDataProvider, K>> {
-    const dataSource = { source: this.source, fallback: this.fallback };
+    // Global concurrency limit for all Bitcoin RPC calls (primary + fallback share the same pool).
+    // The fire-and-forget backup broadcast in postTx() is not routed through call(), and is intentionally not limited here.
+    return this.limit(async () => {
+      const dataSource = { source: this.source, fallback: this.fallback };
 
-    const { env } = this.cradle;
-    if (env.BITCOIN_DATA_PROVIDER === 'mempool' && env.BITCOIN_METHODS_USE_ELECTRS_BY_DEFAULT.includes(method)) {
-      if (this.fallback) {
-        dataSource.source = this.fallback;
-        dataSource.fallback = this.source;
-      } else {
-        this.cradle.logger.warn('No fallback provider, skip using Electrs as default');
-      }
-    }
-
-    const { source, fallback } = dataSource;
-    try {
-      this.cradle.logger.debug(`Calling ${method} with args: ${JSON.stringify(args)}`);
-      const result = await (source[method] as Function).apply(source, args);
-      return result as MethodReturnType<IBitcoinDataProvider, K>;
-    } catch (err) {
-      let calledError = err;
-      this.cradle.logger.error(err);
-      Sentry.captureException(err);
-
-      // Don't fallback for client errors (4xx), as they indicate invalid requests
-      const shouldSkipFallback =
-        isAxiosError(err) && err.response && err.response.status >= 400 && err.response.status < 500;
-      if (shouldSkipFallback) {
-        this.cradle.logger.debug(`Skip fallback: status=${err.response?.status}`);
-      }
-
-      if (fallback && !shouldSkipFallback) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        this.cradle.logger.warn(`Fallback to ${fallback.constructor.name} due to error: ${errorMessage}`);
-        try {
-          const result = await (fallback[method] as Function).apply(fallback, args);
-          return result as MethodReturnType<IBitcoinDataProvider, K>;
-        } catch (fallbackError) {
-          this.cradle.logger.error(fallbackError);
-          Sentry.captureException(fallbackError);
-          calledError = fallbackError;
+      const { env } = this.cradle;
+      if (env.BITCOIN_DATA_PROVIDER === 'mempool' && env.BITCOIN_METHODS_USE_ELECTRS_BY_DEFAULT.includes(method)) {
+        if (this.fallback) {
+          dataSource.source = this.fallback;
+          dataSource.fallback = this.source;
+        } else {
+          this.cradle.logger.warn('No fallback provider, skip using Electrs as default');
         }
       }
-      if (isAxiosError(calledError)) {
-        const error = new BitcoinClientAPIError(calledError.response?.data ?? calledError.message);
-        if (calledError.response?.status) {
-          error.statusCode = calledError.response.status;
+
+      const { source, fallback } = dataSource;
+      try {
+        this.cradle.logger.debug(`Calling ${method} with args: ${JSON.stringify(args)}`);
+        const result = await (source[method] as Function).apply(source, args);
+        return result as MethodReturnType<IBitcoinDataProvider, K>;
+      } catch (err) {
+        let calledError = err;
+        this.cradle.logger.error(err);
+        Sentry.captureException(err);
+
+        // Don't fallback for client errors (4xx), as they indicate invalid requests
+        const shouldSkipFallback =
+          isAxiosError(err) && err.response && err.response.status >= 400 && err.response.status < 500;
+        if (shouldSkipFallback) {
+          this.cradle.logger.debug(`Skip fallback: status=${err.response?.status}`);
         }
-        throw error;
+
+        if (fallback && !shouldSkipFallback) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          this.cradle.logger.warn(`Fallback to ${fallback.constructor.name} due to error: ${errorMessage}`);
+          try {
+            const result = await (fallback[method] as Function).apply(fallback, args);
+            return result as MethodReturnType<IBitcoinDataProvider, K>;
+          } catch (fallbackError) {
+            this.cradle.logger.error(fallbackError);
+            Sentry.captureException(fallbackError);
+            calledError = fallbackError;
+          }
+        }
+        if (isAxiosError(calledError)) {
+          const error = new BitcoinClientAPIError(calledError.response?.data ?? calledError.message);
+          if (calledError.response?.status) {
+            error.statusCode = calledError.response.status;
+          }
+          throw error;
+        }
+        throw err;
       }
-      throw err;
-    }
+    });
   }
 
   public async getBaseURL(): Promise<string> {

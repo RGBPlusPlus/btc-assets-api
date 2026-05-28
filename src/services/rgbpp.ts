@@ -28,7 +28,6 @@ import { IS_MAINNET, TESTNET_TYPE } from '../constants';
 
 type GetCellsParams = Parameters<RPC['getCells']>;
 export type SearchKey = GetCellsParams[0];
-export type CKBBatchRequest = { exec: () => Promise<{ objects: IndexerCell[] }[]> };
 
 export type RgbppUtxoCellsPair = {
   utxo: UTXO;
@@ -153,8 +152,8 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
    * @param typeScript - the type script to filter the cells
    */
   public async getRgbppCellsByBatchRequest(utxos: UTXO[], typeScript?: Script) {
-    const batchRequest: CKBBatchRequest = this.cradle.ckb.rpc.createBatchRequest(
-      utxos.map((utxo: UTXO) => {
+    const result: { objects: IndexerCell[] }[] = await this.cradle.ckb.caller.batch((b) => {
+      utxos.forEach((utxo: UTXO) => {
         const { txid, vout } = utxo;
         const args = buildRgbppLockArgs(vout, txid);
         const searchKey: SearchKey = {
@@ -169,10 +168,9 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
         // TODO: In extreme cases, the num of search target cells may be more than limit=0x64=100
         // Priority: Low
         const params: GetCellsParams = [searchKey, 'desc', '0x64'];
-        return ['getCells', ...params];
-      }),
-    );
-    const result = await batchRequest.exec();
+        b.add('getCells', ...params);
+      });
+    });
     const cells = result.map(({ objects }) => {
       return objects.map((indexerCell) => {
         const { output, outPoint, outputData, blockNumber, txIndex } = indexerCell;
@@ -243,19 +241,18 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
   public async queryRgbppLockTxByBtcTx(btcTx: Transaction, includeOutputOnlyRgbpp?: boolean) {
     // Only query the first RGBPP_TX_INPUTS_MAX_LENGTH transactions for performance reasons
     const maxRecords = `0x${RGBPP_TX_INPUTS_MAX_LENGTH.toString(16)}`;
-    const batchRequest = this.cradle.ckb.rpc.createBatchRequest(
-      btcTx.vout.map((_, index) => {
+    type getTransactionsResult = ReturnType<typeof this.cradle.ckb.rpc.getTransactions<false>>;
+    const transactions: Awaited<getTransactionsResult>[] = await this.cradle.ckb.caller.batch((b) => {
+      btcTx.vout.forEach((_, index) => {
         const args = buildRgbppLockArgs(index, btcTx.txid);
         const lock = genRgbppLockScript(args, IS_MAINNET, TESTNET_TYPE);
         const searchKey: SearchKey = {
           script: lock,
           scriptType: 'lock',
         };
-        return ['getTransactions', searchKey, 'asc', maxRecords];
-      }),
-    );
-    type getTransactionsResult = ReturnType<typeof this.cradle.ckb.rpc.getTransactions<false>>;
-    const transactions: Awaited<getTransactionsResult>[] = await batchRequest.exec();
+        b.add('getTransactions', searchKey, 'asc', maxRecords);
+      });
+    });
     for (const tx of transactions) {
       for (const indexerTx of tx.objects) {
         const ckbTx = await this.cradle.ckb.rpc.getTransaction(indexerTx.txHash);
@@ -270,27 +267,24 @@ export default class RgbppCollector extends BaseQueueWorker<IRgbppCollectRequest
 
   public async queryBtcTimeLockTxByBtcTx(btcTx: Transaction) {
     const rgbppLock = getRgbppLock();
-    const relatedCkbTxs = (
-      await Promise.all(
-        btcTx.vin.map(({ txid, vout }) => {
-          const args = buildRgbppLockArgs(vout, txid);
-          return this.cradle.ckb.rpc.getTransactions(
-            {
-              script: {
-                ...rgbppLock,
-                args,
-              },
-              scriptType: 'lock',
-              groupByTransaction: true,
-            },
-            'asc',
-            '0x64',
-          );
-        }),
-      )
-    )
-      .map(({ objects }) => objects)
-      .flat();
+    // Use a single JSON-RPC batch instead of fan-out: N HTTP round-trips → 1.
+    // CkbRpcCaller.batch auto-splits if vin > CKB_RPC_BATCH_MAX_SIZE.
+    type getTransactionsResult = ReturnType<typeof this.cradle.ckb.rpc.getTransactions<true>>;
+    const transactions: Awaited<getTransactionsResult>[] = await this.cradle.ckb.caller.batch((b) => {
+      btcTx.vin.forEach(({ txid, vout }) => {
+        const args = buildRgbppLockArgs(vout, txid);
+        const searchKey = {
+          script: {
+            ...rgbppLock,
+            args,
+          },
+          scriptType: 'lock' as const,
+          groupByTransaction: true,
+        };
+        b.add('getTransactions', searchKey, 'asc', '0x64');
+      });
+    });
+    const relatedCkbTxs = transactions.flatMap(({ objects }) => objects);
 
     for (const tx of relatedCkbTxs) {
       const ckbTx = await this.cradle.ckb.rpc.getTransaction(tx.txHash);
