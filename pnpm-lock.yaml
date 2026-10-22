@@ -89,6 +89,9 @@ importers:
       axios:
         specifier: ^1.7.7
         version: 1.7.9
+      bitcoinjs-lib:
+        specifier: ^6.1.5
+        version: 6.1.7
       bloom-filters:
         specifier: ^3.0.1
         version: 3.0.4
@@ -165,9 +168,6 @@ importers:
       '@vitest/ui':
         specifier: ^1.3.1
         version: 1.6.1(vitest@1.6.1)
-      bitcoinjs-lib:
-        specifier: ^6.1.5
-        version: 6.1.7
       cross-env:
         specifier: ^7.0.3
         version: 7.0.3

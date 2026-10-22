@@ -1,9 +1,12 @@
-import { beforeEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { buildFastify } from '../../../src/app';
 import { describe } from 'node:test';
 import TransactionProcessor, { ITransactionRequest } from '../../../src/services/transaction';
 import { CKBVirtualResult } from '../../../src/routes/rgbpp/types';
 import { Job } from 'bullmq';
+import { calculateCommitment } from '@rgbpp-sdk/ckb';
+import { Transaction as BitcoinTransaction, payments } from 'bitcoinjs-lib';
+import BitcoinClient from '../../../src/services/bitcoin';
 
 let token: string;
 
@@ -24,6 +27,10 @@ describe('/rgbpp/v1/transaction', () => {
     token = data.token;
 
     await fastify.close();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   const mockCkbVirtualResult: CKBVirtualResult = {
@@ -154,6 +161,128 @@ describe('/rgbpp/v1/transaction', () => {
     expect(data).toEqual({
       message: 'Invalid CKB virtual result: {"formErrors":[],"fieldErrors":{"commitment":["Required"]}}',
     });
+
+    await fastify.close();
+  });
+
+  function buildBtcTx(commitment: string) {
+    const tx = new BitcoinTransaction();
+    tx.version = 2;
+    tx.addInput(Buffer.alloc(32, 0xab), 0);
+    tx.addOutput(Buffer.from(`0014${'00'.repeat(20)}`, 'hex'), 546);
+    tx.addOutput(payments.embed({ data: [Buffer.from(commitment, 'hex')] }).output!, 0);
+    return { txid: tx.getId(), btcTxHex: tx.toHex() };
+  }
+
+  test('Submit transaction', async () => {
+    const fastify = buildFastify();
+    await fastify.ready();
+
+    const ckbVirtualResult = {
+      ...mockCkbVirtualResult,
+      commitment: calculateCommitment(mockCkbVirtualResult.ckbRawTx),
+    };
+    const { txid, btcTxHex } = buildBtcTx(ckbVirtualResult.commitment);
+    const bitcoin: BitcoinClient = fastify.container.resolve('bitcoin');
+    const postTx = vi.spyOn(bitcoin, 'postTx').mockResolvedValueOnce(txid);
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/rgbpp/v1/transaction/submit',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Origin: 'https://test.com',
+      },
+      body: {
+        btc_tx_hex: btcTxHex,
+        ckb_virtual_result: ckbVirtualResult,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ btc_txid: txid, state: 'delayed', broadcast_status: 'sent' });
+    expect(postTx).toHaveBeenCalledWith({ txhex: btcTxHex });
+
+    await fastify.close();
+  });
+
+  test('Submit transaction with invalid btc_tx_hex', async () => {
+    const fastify = buildFastify();
+    await fastify.ready();
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/rgbpp/v1/transaction/submit',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Origin: 'https://test.com',
+      },
+      body: {
+        btc_tx_hex: 'not-a-hex-string',
+        ckb_virtual_result: mockCkbVirtualResult,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ message: 'Invalid btc_tx_hex: should be an even-length hex string' });
+
+    await fastify.close();
+  });
+
+  test('Submit transaction with odd-length btc_tx_hex', async () => {
+    const fastify = buildFastify();
+    await fastify.ready();
+
+    const { btcTxHex } = buildBtcTx(calculateCommitment(mockCkbVirtualResult.ckbRawTx));
+    const bitcoin: BitcoinClient = fastify.container.resolve('bitcoin');
+    const postTx = vi.spyOn(bitcoin, 'postTx');
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/rgbpp/v1/transaction/submit',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Origin: 'https://test.com',
+      },
+      body: {
+        btc_tx_hex: `${btcTxHex}f`,
+        ckb_virtual_result: mockCkbVirtualResult,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({ message: 'Invalid btc_tx_hex: should be an even-length hex string' });
+    expect(postTx).not.toHaveBeenCalled();
+
+    await fastify.close();
+  });
+
+  test('Submit transaction with mismatched commitment', async () => {
+    const fastify = buildFastify();
+    await fastify.ready();
+
+    const { txid, btcTxHex } = buildBtcTx('00'.repeat(32));
+    const bitcoin: BitcoinClient = fastify.container.resolve('bitcoin');
+    const postTx = vi.spyOn(bitcoin, 'postTx');
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/rgbpp/v1/transaction/submit',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Origin: 'https://test.com',
+      },
+      body: {
+        btc_tx_hex: btcTxHex,
+        ckb_virtual_result: mockCkbVirtualResult,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      message: `Commitment mismatch between the Bitcoin transaction and the CKB virtual result: ${txid}`,
+    });
+    expect(postTx).not.toHaveBeenCalled();
 
     await fastify.close();
   });

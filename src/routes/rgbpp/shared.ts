@@ -25,7 +25,7 @@ export function createGetIsomorphicTx(fastify: FastifyInstance, includeOutputOnl
 
     const job = await fastify.transactionProcessor.getTransactionRequest(btcTx.txid);
     if (job) {
-      const { ckbRawTx } = job.data.ckbVirtualResult;
+      const { ckbRawTx } = await fastify.transactionProcessor.getCkbVirtualResult(job);
       isomorphicTx.ckbVirtualTx = ckbRawTx;
       // if the job is completed, get the ckb tx hash and fetch the ckb tx
       const state = await job.getState();

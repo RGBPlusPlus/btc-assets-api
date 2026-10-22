@@ -29,14 +29,14 @@ import { CKBRawTransaction, CKBVirtualResult, Cell } from '../routes/rgbpp/types
 import { BitcoinSPVError } from './spv';
 import { BI } from '@ckb-lumos/lumos';
 import { CKBRpcError, CKBRPCErrorCodes } from './ckb';
-import { cloneDeep } from 'lodash';
+import { cloneDeep, isEqual } from 'lodash';
 import { JwtPayload } from '../plugins/jwt';
 import { serializeCellDep } from '@nervosnetwork/ckb-sdk-utils';
 import { BitcoinClientAPIError } from './bitcoin';
 import { HttpStatusCode } from 'axios';
 import BaseQueueWorker from './base/queue-worker';
 import { Env } from '../env';
-import { getCommitmentFromBtcTx } from '../utils/commitment';
+import { getCommitmentFromBtcTx, getCommitmentFromRawBtcTx } from '../utils/commitment';
 import { isBtcTimeLock, isRgbppLock } from '../utils/lockscript';
 import { addLatestCellDepIfNeeded } from '../utils/cell-deps';
 import { IS_MAINNET } from '../constants';
@@ -49,6 +49,35 @@ export interface ITransactionRequest {
   };
 }
 
+export interface ISubmitTransactionRequest {
+  btcTxHex: string;
+  ckbVirtualResult: CKBVirtualResult;
+  context?: {
+    jwt: JwtPayload;
+  };
+}
+
+/**
+ * The original request of submitTransaction. Kept apart from the job because the worker
+ * rewrites the job data (cell deps, fee) while processing
+ */
+export interface ITransactionSubmission {
+  // set by the first request, never changed
+  ckbVirtualResult: CKBVirtualResult;
+  // signed versions of the same txid (witnesses may differ), newest first
+  btcTxHexes: string[];
+  // creation time in ms
+  createdAt: number;
+  // whether the worker has copied it into the job data
+  applied: boolean;
+}
+
+export interface ISubmitTransactionResult {
+  job: Job<ITransactionRequest>;
+  // set when the broadcast may have failed, the job will retry it
+  broadcastError?: string;
+}
+
 export interface IProcessCallbacks {
   onActive?: (job: Job<ITransactionRequest>) => void;
   onCompleted?: (job: Job<ITransactionRequest>) => void;
@@ -57,6 +86,7 @@ export interface IProcessCallbacks {
 
 interface ITransactionProcessor {
   enqueueTransaction(request: ITransactionRequest): Promise<Job<ITransactionRequest>>;
+  submitTransaction(request: ISubmitTransactionRequest): Promise<ISubmitTransactionResult>;
   getTransactionRequest(txid: string): Promise<Job<ITransactionRequest> | undefined>;
   retryAllFailedJobs(): Promise<{ txid: string; state: string }[]>;
   startProcess(callbacks?: IProcessCallbacks): Promise<void>;
@@ -65,6 +95,61 @@ interface ITransactionProcessor {
 }
 
 export const TRANSACTION_QUEUE_NAME = 'rgbpp-ckb-transaction-queue';
+const TRANSACTION_SUBMISSION_KEY_PREFIX = 'rgbpp-transaction-submission';
+const SUBMISSION_CKB_VIRTUAL_RESULT_FIELD = 'ckbVirtualResult';
+const SUBMISSION_CREATED_AT_FIELD = 'createdAt';
+// one field per signed version: `btcTx:<wtxid>` => `<seq>:<hex>`
+const SUBMISSION_BTC_TX_FIELD_PREFIX = 'btcTx:';
+const SUBMISSION_BTC_TX_SEQ_FIELD = 'seq';
+// set once the worker copies the submission into the job data, so later worker fixes aren't overwritten
+const SUBMISSION_APPLIED_FIELD = 'applied';
+// max signed versions kept per txid
+const SUBMISSION_MAX_BTC_TXS = 5;
+// in seconds, refreshed on every job run, so it only expires after the job stops running
+const SUBMISSION_TTL = 30 * 24 * 60 * 60;
+// give up if the transaction is still missing and rejected by the node after this long
+const SUBMISSION_MAX_RECOVERY_TIME = 14 * 24 * 60 * 60 * 1000;
+// rebroadcast interval once the not-found tolerance window has passed
+const SUBMITTED_TX_REBROADCAST_SLOW_DELAY = 60 * 60 * 1000;
+
+// create the submission if missing, and refresh the TTL
+// returns nil if created, otherwise the existing CKB virtual result
+const SAVE_SUBMISSION_SCRIPT = `
+local saved = redis.call('HGET', KEYS[1], '${SUBMISSION_CKB_VIRTUAL_RESULT_FIELD}')
+if not saved then
+  redis.call('HSET', KEYS[1], '${SUBMISSION_CKB_VIRTUAL_RESULT_FIELD}', ARGV[1], '${SUBMISSION_CREATED_AT_FIELD}', ARGV[2])
+end
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return saved
+`;
+// add a signed version unless it exists or the limit is reached
+// returns 2 = added, 1 = already exists, 0 = limit reached
+const ADD_SUBMISSION_BTC_TX_SCRIPT = `
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then
+  return 1
+end
+local prefix = '${SUBMISSION_BTC_TX_FIELD_PREFIX}'
+local count = 0
+for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
+  if string.sub(field, 1, #prefix) == prefix then
+    count = count + 1
+  end
+end
+if count >= tonumber(ARGV[3]) then
+  return 0
+end
+local seq = redis.call('HINCRBY', KEYS[1], '${SUBMISSION_BTC_TX_SEQ_FIELD}', 1)
+redis.call('HSET', KEYS[1], ARGV[1], seq .. ':' .. ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return 2
+`;
+// only mark an existing submission, HSET on a missing key would create one without TTL
+const MARK_SUBMISSION_APPLIED_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('HSET', KEYS[1], '${SUBMISSION_APPLIED_FIELD}', '1')
+end
+return 1
+`;
 
 class InvalidTransactionError extends Error {
   public data?: ITransactionRequest;
@@ -80,6 +165,44 @@ class TransactionNotConfirmedError extends Error {
   constructor(txid: string) {
     super(`Transaction not confirmed: ${txid}`);
     this.name = this.constructor.name;
+  }
+}
+
+class BitcoinTransactionConflictError extends Error {
+  constructor(txid: string, outPoint: string, spentBy: string) {
+    super(`Bitcoin transaction ${txid} can't be confirmed, input ${outPoint} has been spent by ${spentBy}`);
+    this.name = this.constructor.name;
+  }
+}
+
+class SubmittedTransactionRejectedError extends Error {
+  constructor(txid: string, reason: string) {
+    super(`Bitcoin transaction ${txid} is still not found and rejected after the max recovery time: ${reason}`);
+    this.name = this.constructor.name;
+  }
+}
+
+/**
+ * Whether the node rejected the transaction (4xx, e.g. bad signature, low fee, missing inputs).
+ * 429 and 5xx are treated as temporary
+ * @param err - the broadcast error
+ */
+function isBtcTxRejectedError(err: Error) {
+  return (
+    err instanceof BitcoinClientAPIError &&
+    err.statusCode >= HttpStatusCode.BadRequest &&
+    err.statusCode < HttpStatusCode.InternalServerError &&
+    err.statusCode !== HttpStatusCode.TooManyRequests
+  );
+}
+
+export class SubmitTransactionError extends Error {
+  public statusCode: number;
+
+  constructor(message: string, statusCode: number = HttpStatusCode.BadRequest) {
+    super(message);
+    this.name = this.constructor.name;
+    this.statusCode = statusCode;
   }
 }
 
@@ -118,6 +241,15 @@ export default class TransactionProcessor
     this.limit = pLimit(20); // Control concurrency to avoid overwhelming CKB RPC
 
     this.initializeDeadCellCacheWithKnownDeadCells();
+
+    // a submission may arrive while the job is failing on old data, retry so the next run uses it
+    this.worker.on('failed', (job) => {
+      if (job) {
+        this.retryIfSubmissionNotApplied(job).catch((err) => {
+          this.cradle.logger.warn(`[TransactionProcessor] Failed to retry job ${job.id}: ${(err as Error).message}`);
+        });
+      }
+    });
   }
 
   public static getDefaultJobOptions(env: Env) {
@@ -198,19 +330,15 @@ export default class TransactionProcessor
   }
 
   /**
-   * Verify transaction request
-   * - check if the commitment matches the Bitcoin transaction
-   * - check if the CKB Virtual Transaction is valid
-   * - check if the Bitcoin transaction is confirmed
-   * @param request - transaction request, including txid and ckbVirtualResult
-   * @param btcTx - Bitcoin transaction
+   * Check that the OP_RETURN commitment matches the CKB virtual transaction
+   * @param txid - Bitcoin transaction id
+   * @param btcTxCommitment - commitment from the OP_RETURN output
+   * @param ckbVirtualResult - the CKB virtual result
    */
-  public async verifyTransaction(request: ITransactionRequest, btcTx: Transaction): Promise<boolean> {
-    const { txid, ckbVirtualResult } = request;
+  private async isCommitmentMatched(txid: string, btcTxCommitment: Buffer, ckbVirtualResult: CKBVirtualResult) {
     const { commitment, ckbRawTx } = ckbVirtualResult;
 
     // make sure the commitment matches the Bitcoin transaction
-    const btcTxCommitment = this.getCommitmentFromBtcTx(btcTx);
     if (commitment !== btcTxCommitment.toString('hex')) {
       this.cradle.logger.info(`[TransactionProcessor] Bitcoin Transaction Commitment Mismatch: ${txid}`);
       return false;
@@ -220,6 +348,24 @@ export default class TransactionProcessor
     const ckbRawTxWithoutBtcTxId = await this.resetOutputLockScript(ckbRawTx, txid);
     if (commitment !== calculateCommitment(ckbRawTxWithoutBtcTxId)) {
       this.cradle.logger.info(`[TransactionProcessor] Invalid CKB Virtual Transaction: ${txid}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Verify transaction request
+   * - check if the commitment matches the Bitcoin transaction
+   * - check if the CKB Virtual Transaction is valid
+   * - check if the Bitcoin transaction is confirmed
+   * @param request - transaction request, including txid and ckbVirtualResult
+   * @param btcTx - Bitcoin transaction
+   */
+  public async verifyTransaction(request: ITransactionRequest, btcTx: Transaction): Promise<boolean> {
+    const { txid, ckbVirtualResult } = request;
+
+    const btcTxCommitment = this.getCommitmentFromBtcTx(btcTx);
+    if (!(await this.isCommitmentMatched(txid, btcTxCommitment, ckbVirtualResult))) {
       return false;
     }
 
@@ -356,14 +502,20 @@ export default class TransactionProcessor
    * @param job - the job to move
    * @param token - the token to move the job
    * @param err - the error that caused the delay
+   * @param delay - in ms, TRANSACTION_QUEUE_JOB_DELAY by default
    */
-  private async moveJobToDelayed(job: Job<ITransactionRequest>, token?: string, err?: Error) {
+  private async moveJobToDelayed(
+    job: Job<ITransactionRequest>,
+    token?: string,
+    err?: Error,
+    delay: number = this.cradle.env.TRANSACTION_QUEUE_JOB_DELAY,
+  ) {
     if (err) {
       await this.recordJobError(job, err);
     }
 
     this.cradle.logger.info(`[TransactionProcessor] Moving job ${job.id} to delayed queue`);
-    const timestamp = Date.now() + this.cradle.env.TRANSACTION_QUEUE_JOB_DELAY;
+    const timestamp = Date.now() + delay;
     await job.moveToDelayed(timestamp, token);
     // https://docs.bullmq.io/patterns/process-step-jobs#delaying
     throw new DelayedError();
@@ -668,6 +820,7 @@ export default class TransactionProcessor
    */
   public async process(job: Job<ITransactionRequest>, token?: string) {
     try {
+      await this.applySubmissionToJob(job);
       const { ckbVirtualResult, txid } = cloneDeep(job.data);
       const btcTx = await this.cradle.bitcoin.getTx({ txid });
       const isVerified = await this.verifyTransaction({ ckbVirtualResult, txid }, btcTx);
@@ -696,6 +849,7 @@ export default class TransactionProcessor
 
         await this.cradle.ckb.waitForTranscationConfirmed(txHash);
         this.cradle.logger.info(`[TransactionProcessor] Transaction confirmed: ${txHash}`);
+        await this.removeSubmission(txid);
         // mark the paymaster cell as spent to avoid double spending
         if (ckbVirtualResult.needPaymasterCell) {
           this.cradle.logger.info(`[TransactionProcessor] Mark paymaster cell as spent: ${txHash}`);
@@ -768,14 +922,23 @@ export default class TransactionProcessor
       }
     } catch (err) {
       this.cradle.logger.debug(err);
+      if (err instanceof BitcoinClientAPIError) {
+        // submitted with the signed transaction: keep recovering without using up attempts
+        const submission = await this.getSubmission(job.data.txid);
+        if (submission) {
+          if (err.statusCode === HttpStatusCode.NotFound) {
+            await this.rebroadcastSubmittedTransaction(job, submission, token, err);
+          } else {
+            // API down or rate limited (5xx/429): just wait, don't send more requests
+            await this.moveJobToDelayed(job, token, err, this.getSubmissionRetryDelay(submission));
+          }
+          return;
+        }
+      }
       if (err instanceof BitcoinClientAPIError && err.statusCode === HttpStatusCode.NotFound) {
         // move the job to delayed queue if the transaction is not found yet
-        // only delay the job when the job is created less than 1 hour to make sure the transaction is existed
-        // let the job failed if the transaction is not found after 1 hour
-        const { TRANSACTION_QUEUE_JOB_DELAY, TRANSACTION_QUEUE_JOB_ATTEMPTS } = this.cradle.env;
-        // for example, if the delay is 120s and the attempts is 6, the not found tolerance time is 120 * (2 ** 6) ~= 2 hours
-        const notFoundToleranceTime = TRANSACTION_QUEUE_JOB_DELAY * 2 ** TRANSACTION_QUEUE_JOB_ATTEMPTS;
-        if (Date.now() - job.timestamp < notFoundToleranceTime) {
+        // keep waiting within the tolerance window, fail the job after that
+        if (Date.now() - job.timestamp < this.getNotFoundToleranceTime()) {
           await this.moveJobToDelayed(job, token, err as Error);
           return;
         }
@@ -885,6 +1048,389 @@ export default class TransactionProcessor
   }
 
   /**
+   * Submit the signed BTC transaction and its CKB virtual result in one call:
+   * check the commitment, save the request under the txid, then broadcast.
+   * The txid is known before broadcasting, so retrying the same request is safe.
+   * The saved request stays until the CKB transaction is confirmed, and the job rebroadcasts the BTC
+   * transaction whenever it's missing
+   * @param request - the signed BTC transaction hex and the CKB virtual result
+   */
+  public async submitTransaction(request: ISubmitTransactionRequest): Promise<ISubmitTransactionResult> {
+    const { ckbVirtualResult, context } = request;
+
+    // Buffer.from silently drops a trailing half byte
+    if (!/^([0-9a-fA-F]{2})+$/.test(request.btcTxHex)) {
+      throw new SubmitTransactionError('Invalid Bitcoin transaction hex: should be an even-length hex string');
+    }
+    let btcTx: BitcoinTransaction;
+    try {
+      btcTx = BitcoinTransaction.fromHex(request.btcTxHex);
+    } catch (err) {
+      throw new SubmitTransactionError(`Invalid Bitcoin transaction hex: ${(err as Error).message}`);
+    }
+    // use the re-serialized hex, not the raw input
+    const btcTxHex = btcTx.toHex();
+    const txid = btcTx.getId();
+    const wtxid = Buffer.from(btcTx.getHash(true)).reverse().toString('hex');
+
+    let btcTxCommitment: Buffer;
+    try {
+      btcTxCommitment = getCommitmentFromRawBtcTx(btcTx);
+    } catch (err) {
+      throw new SubmitTransactionError(`Invalid OP_RETURN output: ${(err as Error).message}`);
+    }
+    let isCommitmentMatched: boolean;
+    try {
+      isCommitmentMatched = await this.isCommitmentMatched(txid, btcTxCommitment, ckbVirtualResult);
+    } catch (err) {
+      // e.g. lock args that can't be unpacked
+      throw new SubmitTransactionError(`Invalid CKB virtual result: ${(err as Error).message}`);
+    }
+    if (!isCommitmentMatched) {
+      throw new SubmitTransactionError(
+        `Commitment mismatch between the Bitcoin transaction and the CKB virtual result: ${txid}`,
+      );
+    }
+
+    let job = await this.getTransactionRequest(txid);
+    const state = await job?.getState();
+    // already done
+    if (job && state === 'completed') {
+      return { job };
+    }
+    // a conflicted transaction can never confirm, don't revive its job
+    if (state === 'failed') {
+      const conflict = await this.findConflictedInput(txid, btcTx);
+      if (conflict) {
+        const { message } = new BitcoinTransactionConflictError(txid, conflict.outPoint, conflict.spentBy);
+        throw new SubmitTransactionError(message, HttpStatusCode.Conflict);
+      }
+    }
+
+    const isNewBtcTx = await this.saveSubmission(txid, wtxid, btcTxHex, ckbVirtualResult);
+    const isNewJob = !job;
+    if (!job) {
+      // no-op if /ckb-tx created the job in the meantime
+      await this.enqueueTransaction({ txid, ckbVirtualResult, context });
+      job = await this.getTransactionRequest(txid);
+      if (!job) {
+        throw new Error(`Transaction request not found after enqueueing: ${txid}`);
+      }
+    }
+    // an existing job (e.g. from /ckb-tx) may hold different CKB data, the worker swaps in the submission
+    // on its next run since only it holds the job lock. Revive the job if it has failed
+    await this.retryFailedJob(job);
+    // a new signed version shouldn't wait for the slow rebroadcast interval
+    if (isNewBtcTx && !isNewJob) {
+      await this.rescheduleDelayedJob(job);
+    }
+
+    try {
+      await this.cradle.bitcoin.postTx({ txhex: btcTxHex });
+      this.cradle.logger.info(`[TransactionProcessor] Bitcoin transaction broadcast: ${txid}`);
+      return { job };
+    } catch (err) {
+      // already in the mempool or a block, e.g. a retried request
+      if (await this.isBtcTxFound(txid)) {
+        return { job };
+      }
+      // outcome unknown, keep the submission and let the job retry
+      const broadcastError = (err as Error).message;
+      this.cradle.logger.warn(
+        `[TransactionProcessor] Bitcoin transaction ${txid} may not be broadcast: ${broadcastError}`,
+      );
+      return { job, broadcastError };
+    }
+  }
+
+  /**
+   * Retry the job if it has failed. A concurrent retry is ignored
+   * @param job - the transaction request
+   */
+  private async retryFailedJob(job: Job<ITransactionRequest>) {
+    if ((await job.getState()) !== 'failed') {
+      return;
+    }
+    try {
+      await job.retry('failed');
+      this.cradle.logger.info(`[TransactionProcessor] Retry failed job for the submission: ${job.id}`);
+    } catch (err) {
+      if ((await job.getState()) === 'failed') {
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Called when a job fails: if that run never used the submission (it arrived mid-run), retry the job
+   * @param job - the failed job
+   */
+  private async retryIfSubmissionNotApplied(job: Job<ITransactionRequest>) {
+    const submission = await this.getSubmission(job.data.txid);
+    if (submission && !submission.applied) {
+      await this.retryFailedJob(job);
+    }
+  }
+
+  /**
+   * Bring a delayed job forward to the default delay. No-op if it's no longer delayed
+   * @param job - the transaction request
+   */
+  private async rescheduleDelayedJob(job: Job<ITransactionRequest>) {
+    if ((await job.getState()) !== 'delayed') {
+      return;
+    }
+    try {
+      await job.changeDelay(this.cradle.env.TRANSACTION_QUEUE_JOB_DELAY);
+    } catch (err) {
+      this.cradle.logger.debug(`[TransactionProcessor] Failed to reschedule job ${job.id}: ${(err as Error).message}`);
+    }
+  }
+
+  private getSubmissionKey(txid: string) {
+    return `${TRANSACTION_SUBMISSION_KEY_PREFIX}:${txid}`;
+  }
+
+  /**
+   * Save the submission before broadcasting, and refresh its TTL.
+   * The CKB virtual result is fixed by the first request, later requests must match it.
+   * Every new wtxid (same transaction, different witness) is kept, since we can't tell which signature is valid
+   * @param txid - BTC txid
+   * @param wtxid - BTC wtxid
+   * @param btcTxHex - the signed BTC transaction
+   * @param ckbVirtualResult - the CKB virtual result
+   * @returns true if this signed version is new
+   */
+  private async saveSubmission(txid: string, wtxid: string, btcTxHex: string, ckbVirtualResult: CKBVirtualResult) {
+    const { redis } = this.cradle;
+    const key = this.getSubmissionKey(txid);
+
+    const value = JSON.stringify(ckbVirtualResult);
+    const saved = (await redis.eval(SAVE_SUBMISSION_SCRIPT, 1, key, value, Date.now(), SUBMISSION_TTL)) as
+      | string
+      | null;
+    // compare after a JSON round trip, the same as what's stored
+    if (saved && !isEqual(JSON.parse(saved), JSON.parse(value))) {
+      throw new SubmitTransactionError(
+        `Transaction request already exists with a different CKB virtual result: ${txid}`,
+        HttpStatusCode.Conflict,
+      );
+    }
+
+    // atomic, so concurrent requests can't go over the limit
+    const added = await redis.eval(
+      ADD_SUBMISSION_BTC_TX_SCRIPT,
+      1,
+      key,
+      `${SUBMISSION_BTC_TX_FIELD_PREFIX}${wtxid}`,
+      btcTxHex,
+      SUBMISSION_MAX_BTC_TXS,
+      SUBMISSION_TTL,
+    );
+    if (added === 0) {
+      throw new SubmitTransactionError(
+        `Too many signed Bitcoin transactions submitted with the same txid: ${txid}`,
+        HttpStatusCode.Conflict,
+      );
+    }
+    return added === 2;
+  }
+
+  /**
+   * Get the submission of a txid, or null if it wasn't sent via submitTransaction
+   * @param txid - the Bitcoin transaction id
+   */
+  public async getSubmission(txid: string): Promise<ITransactionSubmission | null> {
+    const fields = await this.cradle.redis.hgetall(this.getSubmissionKey(txid));
+    const ckbVirtualResult = fields[SUBMISSION_CKB_VIRTUAL_RESULT_FIELD];
+    const btcTxs = Object.entries(fields)
+      .filter(([field]) => field.startsWith(SUBMISSION_BTC_TX_FIELD_PREFIX))
+      .map(([, value]) => {
+        const [seq, btcTxHex] = value.split(':');
+        return { seq: Number(seq), btcTxHex };
+      });
+    if (!ckbVirtualResult || btcTxs.length === 0) {
+      return null;
+    }
+    return {
+      ckbVirtualResult: JSON.parse(ckbVirtualResult) as CKBVirtualResult,
+      btcTxHexes: btcTxs.sort((a, b) => b.seq - a.seq).map(({ btcTxHex }) => btcTxHex),
+      createdAt: Number(fields[SUBMISSION_CREATED_AT_FIELD]),
+      applied: fields[SUBMISSION_APPLIED_FIELD] === '1',
+    };
+  }
+
+  /**
+   * The CKB virtual result the job will actually process: the submission until the worker has applied it,
+   * then the job data
+   * @param job - the transaction request
+   */
+  public async getCkbVirtualResult(job: Job<ITransactionRequest>): Promise<CKBVirtualResult> {
+    const key = this.getSubmissionKey(job.data.txid);
+    const [value, applied] = await this.cradle.redis.hmget(
+      key,
+      SUBMISSION_CKB_VIRTUAL_RESULT_FIELD,
+      SUBMISSION_APPLIED_FIELD,
+    );
+    if (value && !applied) {
+      return JSON.parse(value) as CKBVirtualResult;
+    }
+    return job.data.ckbVirtualResult;
+  }
+
+  /**
+   * On the first run after a submission, overwrite the job data with it, since the job may come from /ckb-tx
+   * with different data. Runs in the worker, which holds the job lock. Later worker fixes are kept.
+   * Also refreshes the submission TTL
+   * @param job - the job being processed
+   */
+  private async applySubmissionToJob(job: Job<ITransactionRequest>) {
+    const { redis } = this.cradle;
+    const key = this.getSubmissionKey(job.data.txid);
+    // no-op if missing
+    await redis.expire(key, SUBMISSION_TTL);
+    const [value, applied] = await redis.hmget(key, SUBMISSION_CKB_VIRTUAL_RESULT_FIELD, SUBMISSION_APPLIED_FIELD);
+    if (!value || applied) {
+      return;
+    }
+
+    const ckbVirtualResult = JSON.parse(value) as CKBVirtualResult;
+    if (!isEqual(job.data.ckbVirtualResult, ckbVirtualResult)) {
+      this.cradle.logger.info(`[TransactionProcessor] Apply the submission to the job data: ${job.data.txid}`);
+      await job.updateData({ ...job.data, ckbVirtualResult });
+    }
+    // mark last, so a crash before this re-applies it next time
+    await redis.eval(MARK_SUBMISSION_APPLIED_SCRIPT, 1, key);
+  }
+
+  /**
+   * Delete the submission once the CKB transaction is confirmed. Errors are ignored so the job still completes,
+   * anything saved again afterwards expires by TTL
+   * @param txid - the Bitcoin transaction id
+   */
+  private async removeSubmission(txid: string) {
+    try {
+      await this.cradle.redis.del(this.getSubmissionKey(txid));
+    } catch (err) {
+      this.cradle.logger.warn(`[TransactionProcessor] Failed to remove submission ${txid}: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Whether the transaction is in the mempool or a block. False if it's not found or the query fails
+   * @param txid - the transaction id
+   */
+  private async isBtcTxFound(txid: string) {
+    try {
+      await this.cradle.bitcoin.getTx({ txid });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * How long a job waits for its BTC transaction to show up,
+   * e.g. a 120s delay with 6 attempts gives 120 * 2 ** 6 ~= 2 hours
+   */
+  private getNotFoundToleranceTime() {
+    const { TRANSACTION_QUEUE_JOB_DELAY, TRANSACTION_QUEUE_JOB_ATTEMPTS } = this.cradle.env;
+    return TRANSACTION_QUEUE_JOB_DELAY * 2 ** TRANSACTION_QUEUE_JOB_ATTEMPTS;
+  }
+
+  /**
+   * Retry delay for a submitted transaction: the default delay at first, then hourly after the tolerance window
+   * @param submission - the submission
+   */
+  private getSubmissionRetryDelay(submission: ITransactionSubmission) {
+    const { TRANSACTION_QUEUE_JOB_DELAY } = this.cradle.env;
+    if (Date.now() - submission.createdAt < this.getNotFoundToleranceTime()) {
+      return TRANSACTION_QUEUE_JOB_DELAY;
+    }
+    return Math.max(TRANSACTION_QUEUE_JOB_DELAY, SUBMITTED_TX_REBROADCAST_SLOW_DELAY);
+  }
+
+  /**
+   * Find an input already spent by another confirmed transaction, which means this one can never confirm.
+   * Inputs that can't be queried are skipped
+   * @param txid - BTC txid
+   * @param btcTx - the signed BTC transaction
+   */
+  private async findConflictedInput(txid: string, btcTx: BitcoinTransaction) {
+    for (const input of btcTx.ins) {
+      const prevTxid = Buffer.from(input.hash).reverse().toString('hex');
+      try {
+        const outspend = await this.cradle.bitcoin.getTxOutspend({ txid: prevTxid, vout: input.index });
+        if (outspend.spent && outspend.txid && outspend.txid !== txid && outspend.status?.confirmed) {
+          return { outPoint: `${prevTxid}:${input.index}`, spentBy: outspend.txid };
+        }
+      } catch (err) {
+        this.cradle.logger.debug(
+          `[TransactionProcessor] Failed to get outspend of ${prevTxid}:${input.index}: ${(err as Error).message}`,
+        );
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Rebroadcast a submitted transaction that can't be found, no matter how long the job has waited
+   * (e.g. after downtime). Fails the job if an input is spent elsewhere, or the node still rejects it
+   * after the max recovery time
+   * @param job - the job being processed
+   * @param submission - the submission
+   * @param token - the job lock token
+   * @param err - the not-found error
+   */
+  private async rebroadcastSubmittedTransaction(
+    job: Job<ITransactionRequest>,
+    submission: ITransactionSubmission,
+    token?: string,
+    err?: Error,
+  ) {
+    const { txid } = job.data;
+    // all signed versions share the same inputs
+    const conflict = await this.findConflictedInput(txid, BitcoinTransaction.fromHex(submission.btcTxHexes[0]));
+    if (conflict) {
+      const conflictError = new BitcoinTransactionConflictError(txid, conflict.outPoint, conflict.spentBy);
+      await this.recordJobError(job, conflictError);
+      this.cradle.logger.warn(`[TransactionProcessor] ${conflictError.message}`);
+      throw new UnrecoverableError(conflictError.message);
+    }
+
+    // newest first, an older one may have a bad signature
+    const rebroadcastErrors: Error[] = [];
+    for (const btcTxHex of submission.btcTxHexes) {
+      try {
+        await this.cradle.bitcoin.postTx({ txhex: btcTxHex });
+        this.cradle.logger.info(`[TransactionProcessor] Bitcoin transaction rebroadcast: ${txid}`);
+        break;
+      } catch (broadcastErr) {
+        rebroadcastErrors.push(broadcastErr as Error);
+        this.cradle.logger.warn(
+          `[TransactionProcessor] Failed to rebroadcast Bitcoin transaction ${txid}: ${(broadcastErr as Error).message}`,
+        );
+      }
+    }
+
+    const isRebroadcast = rebroadcastErrors.length < submission.btcTxHexes.length;
+    if (
+      !isRebroadcast &&
+      rebroadcastErrors.every(isBtcTxRejectedError) &&
+      Date.now() - submission.createdAt >= SUBMISSION_MAX_RECOVERY_TIME
+    ) {
+      const rejectedError = new SubmittedTransactionRejectedError(txid, rebroadcastErrors[0].message);
+      await this.recordJobError(job, rejectedError);
+      this.cradle.logger.warn(`[TransactionProcessor] ${rejectedError.message}`);
+      throw new UnrecoverableError(rejectedError.message);
+    }
+
+    // if nothing went through, record the newest version's error
+    const delayReason = isRebroadcast ? err : rebroadcastErrors[0];
+    await this.moveJobToDelayed(job, token, delayReason, this.getSubmissionRetryDelay(submission));
+  }
+
+  /**
    * Get the transaction request from the queue
    * @param txid - the transaction id
    */
@@ -909,7 +1455,7 @@ export default class TransactionProcessor
       return [];
     }
 
-    const { ckbVirtualResult } = job.data;
+    const ckbVirtualResult = await this.getCkbVirtualResult(job);
     const outputs = ckbVirtualResult.ckbRawTx.outputs;
     return outputs.map((output, index) => {
       return Cell.parse({
@@ -935,7 +1481,7 @@ export default class TransactionProcessor
       return [];
     }
 
-    const { ckbVirtualResult } = job.data;
+    const ckbVirtualResult = await this.getCkbVirtualResult(job);
     const inputOutPoints = ckbVirtualResult.ckbRawTx.inputs.map((input) => input.previousOutput!);
     return await this.cradle.ckb.getInputCellsByOutPoint(inputOutPoints);
   }

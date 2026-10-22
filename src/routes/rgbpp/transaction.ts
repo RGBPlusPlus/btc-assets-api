@@ -1,4 +1,4 @@
-import { FastifyPluginCallback } from 'fastify';
+import { FastifyPluginCallback, FastifyRequest } from 'fastify';
 import { ZodTypeProvider } from 'fastify-type-provider-zod';
 import { Server } from 'http';
 import z from 'zod';
@@ -8,7 +8,31 @@ import { CUSTOM_HEADERS } from '../../constants';
 import { JwtPayload } from '../../plugins/jwt';
 import { env } from '../../env';
 
+function getJwtPayload(request: FastifyRequest): JwtPayload {
+  // Development environment: use mock JWT payload
+  if (env.NODE_ENV === 'development') {
+    return {
+      sub: 'dev-app',
+      aud: 'dev-rgbpp',
+      jti: 'dev-token-id',
+    };
+  }
+  // Production environment: use real JWT from request
+  return request.user as JwtPayload;
+}
+
 const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodTypeProvider> = (fastify, _, done) => {
+  const ckbVirtualResultBody = CKBVirtualResult.or(z.string()).transform((value) => {
+    if (typeof value === 'string') {
+      value = JSON.parse(value);
+    }
+    const parsed = CKBVirtualResult.safeParse(value);
+    if (!parsed.success) {
+      throw fastify.httpErrors.badRequest(`Invalid CKB virtual result: ${JSON.stringify(parsed.error.flatten())}`);
+    }
+    return parsed.data;
+  });
+
   fastify.post(
     '/ckb-tx',
     {
@@ -18,18 +42,7 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
         tags: ['RGB++'],
         body: z.object({
           btc_txid: z.string(),
-          ckb_virtual_result: CKBVirtualResult.or(z.string()).transform((value) => {
-            if (typeof value === 'string') {
-              value = JSON.parse(value);
-            }
-            const parsed = CKBVirtualResult.safeParse(value);
-            if (!parsed.success) {
-              throw fastify.httpErrors.badRequest(
-                `Invalid CKB virtual result: ${JSON.stringify(parsed.error.flatten())}`,
-              );
-            }
-            return parsed.data;
-          }),
+          ckb_virtual_result: ckbVirtualResultBody,
         }),
         response: {
           200: z.object({
@@ -40,20 +53,7 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
     },
     async (request, reply) => {
       const { btc_txid, ckb_virtual_result } = request.body;
-
-      let jwt: JwtPayload;
-
-      // Development environment: use mock JWT payload
-      if (env.NODE_ENV === 'development') {
-        jwt = {
-          sub: 'dev-app',
-          aud: 'dev-rgbpp',
-          jti: 'dev-token-id',
-        };
-      } else {
-        // Production environment: use real JWT from request
-        jwt = request.user as JwtPayload;
-      }
+      const jwt = getJwtPayload(request);
 
       const job: Job = await fastify.transactionProcessor.enqueueTransaction({
         txid: btc_txid,
@@ -62,6 +62,68 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
       });
       const state = await job.getState();
       reply.send({ state });
+    },
+  );
+
+  fastify.post(
+    '/submit',
+    {
+      schema: {
+        description: `
+          Submit a signed RGB++ BTC transaction together with its CKB virtual transaction.
+
+          The service checks the OP_RETURN commitment, saves the request under the BTC txid, then broadcasts.
+          If the broadcast fails or the transaction goes missing, it keeps rebroadcasting until the transaction
+          is confirmed, an input is spent by another confirmed transaction, or it's still rejected after 14 days.
+          A failed request with the same txid is resumed, unless its BTC transaction is conflicted.
+
+          broadcast_status:
+          * sent: broadcast, or already in the mempool or a block.
+          * pending: outcome unknown (see broadcast_error), the service will retry.
+
+          Retrying the same request is safe. A re-signed transaction (same txid, different witness) can be
+          submitted again, up to 5 versions are kept and retried newest first. ckb_virtual_result must match
+          the first request. Track the state with /rgbpp/v1/transaction/:btc_txid/job.
+
+          Note: When including multiple assets, especially Spore, in a single transaction, please evaluate and ensure the final CKB transaction size does not exceed 512,000 bytes, otherwise the CKB node will reject it and permanently prevent RGB++ assets from being unlocked.
+        `,
+        tags: ['RGB++'],
+        body: z.object({
+          btc_tx_hex: z
+            .string()
+            .regex(/^([0-9a-fA-F]{2})+$/, 'should be an even-length hex string')
+            .describe('The signed BTC transaction hex'),
+          ckb_virtual_result: ckbVirtualResultBody,
+        }),
+        response: {
+          200: z.object({
+            btc_txid: z.string().describe('The BTC transaction id'),
+            state: z.string().describe('The state of the transaction, delayed by default'),
+            broadcast_status: z.enum(['sent', 'pending']).describe('Whether the BTC transaction has been broadcast'),
+            broadcast_error: z
+              .string()
+              .optional()
+              .describe('The broadcast error, only when broadcast_status is pending'),
+          }),
+        },
+      },
+    },
+    async (request) => {
+      const { btc_tx_hex, ckb_virtual_result } = request.body;
+      const jwt = getJwtPayload(request);
+
+      const { job, broadcastError } = await fastify.transactionProcessor.submitTransaction({
+        btcTxHex: btc_tx_hex,
+        ckbVirtualResult: ckb_virtual_result,
+        context: { jwt },
+      });
+      const state = await job.getState();
+      return {
+        btc_txid: job.data.txid,
+        state,
+        broadcast_status: broadcastError ? ('pending' as const) : ('sent' as const),
+        broadcast_error: broadcastError,
+      };
     },
   );
 
@@ -175,10 +237,9 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
       };
 
       if (with_data === 'true') {
-        const { txid, ckbVirtualResult } = job.data;
         jobInfo.data = {
-          txid,
-          ckbVirtualResult,
+          txid: job.data.txid,
+          ckbVirtualResult: await fastify.transactionProcessor.getCkbVirtualResult(job),
         };
       }
 
