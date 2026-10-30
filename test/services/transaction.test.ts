@@ -213,6 +213,7 @@ describe('transactionProcessor: submitTransaction', () => {
     }
     return {
       txid: tx.getId(),
+      wtxid: Buffer.from(tx.getHash(true)).reverse().toString('hex'),
       btcTxHex: tx.toHex(),
       prevTxid: Buffer.alloc(32, seed).reverse().toString('hex'),
       opReturnScript: opReturnScript.toString('hex'),
@@ -397,6 +398,22 @@ describe('transactionProcessor: submitTransaction', () => {
     expect(results.filter(({ broadcastError }) => broadcastError)).toHaveLength(1);
     expect(await transactionProcessor.getTransactionRequest(txid)).toBeDefined();
     expect(await transactionProcessor.getSubmission(txid)).toMatchObject({ ckbVirtualResult, btcTxHexes: [btcTxHex] });
+  });
+
+  test('submitTransaction: should report the broadcast error even if its message is empty', async () => {
+    const { txid, btcTxHex } = buildBtcTx(35);
+    // e.g. an upstream 503 with an empty body
+    vi.spyOn(cradle.bitcoin, 'postTx').mockRejectedValueOnce(
+      createBitcoinClientAPIError('', HttpStatusCode.ServiceUnavailable),
+    );
+    vi.spyOn(cradle.bitcoin, 'getTx').mockRejectedValueOnce(
+      createBitcoinClientAPIError('Transaction not found', HttpStatusCode.NotFound),
+    );
+
+    const { broadcastError } = await submit(btcTxHex);
+
+    expect(broadcastError).toBe('Bitcoin API error, status 503');
+    expect(await transactionProcessor.getSubmission(txid)).toMatchObject({ btcTxHexes: [btcTxHex] });
   });
 
   test('submitTransaction: should keep the submission when the broadcast is rate limited', async () => {
@@ -609,15 +626,15 @@ describe('transactionProcessor: submitTransaction', () => {
       getState: vi.fn().mockResolvedValue('failed'),
       retry: vi.fn(),
     } as unknown as Job<ITransactionRequest>;
-    const retryIfSubmissionNotApplied = vi.spyOn(
-      transactionProcessor as unknown as { retryIfSubmissionNotApplied: () => Promise<void> },
-      'retryIfSubmissionNotApplied',
+    const retryIfSubmissionUnused = vi.spyOn(
+      transactionProcessor as unknown as { retryIfSubmissionUnused: () => Promise<void> },
+      'retryIfSubmissionUnused',
     );
 
     transactionProcessor['worker'].emit('failed', job, new Error('Conflicted'), 'active');
 
-    await vi.waitFor(() => expect(retryIfSubmissionNotApplied).toHaveBeenCalled());
-    await retryIfSubmissionNotApplied.mock.results[0].value;
+    await vi.waitFor(() => expect(retryIfSubmissionUnused).toHaveBeenCalled());
+    await retryIfSubmissionUnused.mock.results[0].value;
     expect(job.retry).not.toHaveBeenCalled();
   });
 
@@ -728,6 +745,149 @@ describe('transactionProcessor: submitTransaction', () => {
     const job = mockJob(txid);
 
     await expect(transactionProcessor.process(job)).rejects.toThrow(UnrecoverableError);
+  });
+
+  test('process: should not give up if the transaction shows up after the rejection', async () => {
+    const { txid, btcTxHex } = buildBtcTx(36);
+    await saveSubmission(btcTxHex);
+    await ageSubmission(txid, 15 * 24 * 60 * 60 * 1000);
+    // the first lookup is stale, the transaction has confirmed by the time it's rebroadcast
+    vi.spyOn(cradle.bitcoin, 'getTx')
+      .mockRejectedValueOnce(createBitcoinClientAPIError('Transaction not found', HttpStatusCode.NotFound))
+      .mockResolvedValueOnce({ txid } as unknown as Transaction);
+    vi.spyOn(cradle.bitcoin, 'getTxOutspend').mockResolvedValue({ spent: false });
+    vi.spyOn(cradle.bitcoin, 'postTx').mockRejectedValue(
+      createBitcoinClientAPIError(
+        'sendrawtransaction RPC error: {"code":-27,"message":"Transaction already in block chain"}',
+        HttpStatusCode.BadRequest,
+      ),
+    );
+    mockRecordJobError();
+    const job = mockJob(txid);
+
+    const now = Date.now();
+    await expect(transactionProcessor.process(job)).rejects.toThrow(DelayedError);
+    const [delayedTimestamp] = vi.mocked(job.moveToDelayed).mock.calls[0];
+    expect(delayedTimestamp).toBeLessThan(now + 60 * 60 * 1000);
+  });
+
+  test('process: should not give up when the lookup after the rejection fails', async () => {
+    const { txid, btcTxHex } = buildBtcTx(39);
+    await saveSubmission(btcTxHex);
+    await ageSubmission(txid, 15 * 24 * 60 * 60 * 1000);
+    vi.spyOn(cradle.bitcoin, 'getTx')
+      .mockRejectedValueOnce(createBitcoinClientAPIError('Transaction not found', HttpStatusCode.NotFound))
+      .mockRejectedValueOnce(createBitcoinClientAPIError('Service Unavailable', HttpStatusCode.ServiceUnavailable));
+    vi.spyOn(cradle.bitcoin, 'getTxOutspend').mockResolvedValue({ spent: false });
+    vi.spyOn(cradle.bitcoin, 'postTx').mockRejectedValue(
+      createBitcoinClientAPIError(
+        'sendrawtransaction RPC error: {"code":-27,"message":"Transaction already in block chain"}',
+        HttpStatusCode.BadRequest,
+      ),
+    );
+    mockRecordJobError();
+
+    await expect(transactionProcessor.process(mockJob(txid))).rejects.toThrow(DelayedError);
+  });
+
+  test('process: should not retry a conflicted job because of an earlier checkedSeq', async () => {
+    const old = buildBtcTx(40, { witness: 'aa' });
+    const resigned = buildBtcTx(40, { witness: 'bb' });
+    await saveSubmission(old.btcTxHex);
+    await saveSubmission(resigned.btcTxHex);
+    // left by an earlier run that gave up on the old version, then retried for the new one
+    await cradle.redis.hset(getSubmissionKey(old.txid), 'applied', '1', 'checkedSeq', '1');
+    vi.spyOn(cradle.bitcoin, 'getTx').mockRejectedValue(
+      createBitcoinClientAPIError('Transaction not found', HttpStatusCode.NotFound),
+    );
+    vi.spyOn(cradle.bitcoin, 'getTxOutspend').mockResolvedValue({
+      spent: true,
+      txid: 'ff'.repeat(32),
+      vout: 0,
+      status: { confirmed: true, block_height: 100 },
+    } as unknown as Awaited<ReturnType<typeof cradle.bitcoin.getTxOutspend>>);
+    mockRecordJobError();
+    await expect(transactionProcessor.process(mockJob(old.txid))).rejects.toThrow(UnrecoverableError);
+
+    const failedJob = {
+      id: old.txid,
+      data: { txid: old.txid, ckbVirtualResult },
+      getState: vi.fn().mockResolvedValue('failed'),
+      retry: vi.fn(),
+    } as unknown as Job<ITransactionRequest>;
+    const retryIfSubmissionUnused = vi.spyOn(
+      transactionProcessor as unknown as { retryIfSubmissionUnused: () => Promise<void> },
+      'retryIfSubmissionUnused',
+    );
+    transactionProcessor['worker'].emit('failed', failedJob, new Error('Conflicted'), 'active');
+
+    await vi.waitFor(() => expect(retryIfSubmissionUnused).toHaveBeenCalled());
+    await retryIfSubmissionUnused.mock.results[0].value;
+    expect(failedJob.retry).not.toHaveBeenCalled();
+  });
+
+  test('process: should retry the job given up while a new signed version was submitted', async () => {
+    const old = buildBtcTx(37, { witness: 'aa' });
+    const resigned = buildBtcTx(37, { witness: 'bb' });
+    await saveSubmission(old.btcTxHex);
+    await ageSubmission(old.txid, 15 * 24 * 60 * 60 * 1000);
+    await cradle.redis.hset(getSubmissionKey(old.txid), 'applied', '1');
+    vi.spyOn(cradle.bitcoin, 'getTx').mockRejectedValue(
+      createBitcoinClientAPIError('Transaction not found', HttpStatusCode.NotFound),
+    );
+    vi.spyOn(cradle.bitcoin, 'getTxOutspend').mockResolvedValue({ spent: false });
+    vi.spyOn(cradle.bitcoin, 'postTx').mockImplementation(async () => {
+      // /submit saves a re-signed version while the worker is rebroadcasting the old one
+      await transactionProcessor['saveSubmission'](old.txid, resigned.wtxid, resigned.btcTxHex, ckbVirtualResult);
+      throw createBitcoinClientAPIError(
+        'sendrawtransaction RPC error: {"code":-26,"message":"mandatory-script-verify-flag-failed"}',
+        HttpStatusCode.BadRequest,
+      );
+    });
+    mockRecordJobError();
+    await expect(transactionProcessor.process(mockJob(old.txid))).rejects.toThrow(UnrecoverableError);
+
+    const failedJob = {
+      id: old.txid,
+      data: { txid: old.txid, ckbVirtualResult },
+      getState: vi.fn().mockResolvedValue('failed'),
+      retry: vi.fn(),
+    } as unknown as Job<ITransactionRequest>;
+    transactionProcessor['worker'].emit('failed', failedJob, new Error('Rejected'), 'active');
+
+    await vi.waitFor(() => expect(failedJob.retry).toHaveBeenCalledWith('failed'));
+  });
+
+  test('process: should not retry the job given up after trying every signed version', async () => {
+    const { txid, btcTxHex } = buildBtcTx(38);
+    await saveSubmission(btcTxHex);
+    await ageSubmission(txid, 15 * 24 * 60 * 60 * 1000);
+    await cradle.redis.hset(getSubmissionKey(txid), 'applied', '1');
+    vi.spyOn(cradle.bitcoin, 'getTx').mockRejectedValue(
+      createBitcoinClientAPIError('Transaction not found', HttpStatusCode.NotFound),
+    );
+    vi.spyOn(cradle.bitcoin, 'getTxOutspend').mockResolvedValue({ spent: false });
+    vi.spyOn(cradle.bitcoin, 'postTx').mockRejectedValue(
+      createBitcoinClientAPIError('Rejected', HttpStatusCode.BadRequest),
+    );
+    mockRecordJobError();
+    await expect(transactionProcessor.process(mockJob(txid))).rejects.toThrow(UnrecoverableError);
+
+    const failedJob = {
+      id: txid,
+      data: { txid, ckbVirtualResult },
+      getState: vi.fn().mockResolvedValue('failed'),
+      retry: vi.fn(),
+    } as unknown as Job<ITransactionRequest>;
+    const retryIfSubmissionUnused = vi.spyOn(
+      transactionProcessor as unknown as { retryIfSubmissionUnused: () => Promise<void> },
+      'retryIfSubmissionUnused',
+    );
+    transactionProcessor['worker'].emit('failed', failedJob, new Error('Rejected'), 'active');
+
+    await vi.waitFor(() => expect(retryIfSubmissionUnused).toHaveBeenCalled());
+    await retryIfSubmissionUnused.mock.results[0].value;
+    expect(failedJob.retry).not.toHaveBeenCalled();
   });
 
   test.each([

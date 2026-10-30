@@ -70,6 +70,10 @@ export interface ITransactionSubmission {
   createdAt: number;
   // whether the worker has copied it into the job data
   applied: boolean;
+  // seq of the newest signed version
+  seq: number;
+  // seq of the newest version tried, set only when the latest run gave up on rejection
+  checkedSeq?: number;
 }
 
 export interface ISubmitTransactionResult {
@@ -103,6 +107,9 @@ const SUBMISSION_BTC_TX_FIELD_PREFIX = 'btcTx:';
 const SUBMISSION_BTC_TX_SEQ_FIELD = 'seq';
 // set once the worker copies the submission into the job data, so later worker fixes aren't overwritten
 const SUBMISSION_APPLIED_FIELD = 'applied';
+// set when a run gives up on rejection and cleared when the next run starts, so the failed listener
+// can tell whether a newer version arrived during that run
+const SUBMISSION_CHECKED_SEQ_FIELD = 'checkedSeq';
 // max signed versions kept per txid
 const SUBMISSION_MAX_BTC_TXS = 5;
 // in seconds, refreshed on every job run, so it only expires after the job stops running
@@ -143,10 +150,10 @@ redis.call('HSET', KEYS[1], ARGV[1], seq .. ':' .. ARGV[2])
 redis.call('EXPIRE', KEYS[1], ARGV[4])
 return 2
 `;
-// only mark an existing submission, HSET on a missing key would create one without TTL
-const MARK_SUBMISSION_APPLIED_SCRIPT = `
+// only update an existing submission, HSET on a missing key would create one without TTL
+const SET_SUBMISSION_FIELD_SCRIPT = `
 if redis.call('EXISTS', KEYS[1]) == 1 then
-  redis.call('HSET', KEYS[1], '${SUBMISSION_APPLIED_FIELD}', '1')
+  redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
 end
 return 1
 `;
@@ -196,6 +203,20 @@ function isBtcTxRejectedError(err: Error) {
   );
 }
 
+/**
+ * Error message that is never empty, e.g. an upstream 503 can come with an empty body
+ * @param err - the error
+ */
+function getErrorMessage(err: Error) {
+  if (err.message) {
+    return err.message;
+  }
+  if (err instanceof BitcoinClientAPIError) {
+    return `Bitcoin API error, status ${err.statusCode}`;
+  }
+  return err.name;
+}
+
 export class SubmitTransactionError extends Error {
   public statusCode: number;
 
@@ -242,10 +263,10 @@ export default class TransactionProcessor
 
     this.initializeDeadCellCacheWithKnownDeadCells();
 
-    // a submission may arrive while the job is failing on old data, retry so the next run uses it
+    // a submission or a new signed version may arrive while the job is failing, retry so the next run uses it
     this.worker.on('failed', (job) => {
       if (job) {
-        this.retryIfSubmissionNotApplied(job).catch((err) => {
+        this.retryIfSubmissionUnused(job).catch((err) => {
           this.cradle.logger.warn(`[TransactionProcessor] Failed to retry job ${job.id}: ${(err as Error).message}`);
         });
       }
@@ -1131,11 +1152,11 @@ export default class TransactionProcessor
       return { job };
     } catch (err) {
       // already in the mempool or a block, e.g. a retried request
-      if (await this.isBtcTxFound(txid)) {
+      if ((await this.lookupBtcTx(txid)) === 'found') {
         return { job };
       }
       // outcome unknown, keep the submission and let the job retry
-      const broadcastError = (err as Error).message;
+      const broadcastError = getErrorMessage(err as Error);
       this.cradle.logger.warn(
         `[TransactionProcessor] Bitcoin transaction ${txid} may not be broadcast: ${broadcastError}`,
       );
@@ -1162,12 +1183,18 @@ export default class TransactionProcessor
   }
 
   /**
-   * Called when a job fails: if that run never used the submission (it arrived mid-run), retry the job
+   * Called when a job fails: retry it if that run didn't use the whole submission, i.e. the submission
+   * or a newer signed version arrived mid-run
    * @param job - the failed job
    */
-  private async retryIfSubmissionNotApplied(job: Job<ITransactionRequest>) {
+  private async retryIfSubmissionUnused(job: Job<ITransactionRequest>) {
     const submission = await this.getSubmission(job.data.txid);
-    if (submission && !submission.applied) {
+    if (!submission) {
+      return;
+    }
+    const { applied, seq, checkedSeq } = submission;
+    // checkedSeq is only set when giving up on rejection, other failures (e.g. conflicts) are final
+    if (!applied || (checkedSeq !== undefined && seq > checkedSeq)) {
       await this.retryFailedJob(job);
     }
   }
@@ -1252,11 +1279,15 @@ export default class TransactionProcessor
     if (!ckbVirtualResult || btcTxs.length === 0) {
       return null;
     }
+    btcTxs.sort((a, b) => b.seq - a.seq);
+    const checkedSeq = fields[SUBMISSION_CHECKED_SEQ_FIELD];
     return {
       ckbVirtualResult: JSON.parse(ckbVirtualResult) as CKBVirtualResult,
-      btcTxHexes: btcTxs.sort((a, b) => b.seq - a.seq).map(({ btcTxHex }) => btcTxHex),
+      btcTxHexes: btcTxs.map(({ btcTxHex }) => btcTxHex),
       createdAt: Number(fields[SUBMISSION_CREATED_AT_FIELD]),
       applied: fields[SUBMISSION_APPLIED_FIELD] === '1',
+      seq: btcTxs[0].seq,
+      checkedSeq: checkedSeq === undefined ? undefined : Number(checkedSeq),
     };
   }
 
@@ -1281,14 +1312,15 @@ export default class TransactionProcessor
   /**
    * On the first run after a submission, overwrite the job data with it, since the job may come from /ckb-tx
    * with different data. Runs in the worker, which holds the job lock. Later worker fixes are kept.
-   * Also refreshes the submission TTL
+   * Called at the start of every run: refreshes the submission TTL and clears the previous run's checkedSeq
    * @param job - the job being processed
    */
   private async applySubmissionToJob(job: Job<ITransactionRequest>) {
     const { redis } = this.cradle;
     const key = this.getSubmissionKey(job.data.txid);
-    // no-op if missing
+    // both are no-ops if missing
     await redis.expire(key, SUBMISSION_TTL);
+    await redis.hdel(key, SUBMISSION_CHECKED_SEQ_FIELD);
     const [value, applied] = await redis.hmget(key, SUBMISSION_CKB_VIRTUAL_RESULT_FIELD, SUBMISSION_APPLIED_FIELD);
     if (!value || applied) {
       return;
@@ -1300,7 +1332,7 @@ export default class TransactionProcessor
       await job.updateData({ ...job.data, ckbVirtualResult });
     }
     // mark last, so a crash before this re-applies it next time
-    await redis.eval(MARK_SUBMISSION_APPLIED_SCRIPT, 1, key);
+    await redis.eval(SET_SUBMISSION_FIELD_SCRIPT, 1, key, SUBMISSION_APPLIED_FIELD, '1');
   }
 
   /**
@@ -1317,15 +1349,18 @@ export default class TransactionProcessor
   }
 
   /**
-   * Whether the transaction is in the mempool or a block. False if it's not found or the query fails
+   * Look up the transaction in the mempool and blocks: found, missing (404), or unknown (the query failed)
    * @param txid - the transaction id
    */
-  private async isBtcTxFound(txid: string) {
+  private async lookupBtcTx(txid: string): Promise<'found' | 'missing' | 'unknown'> {
     try {
       await this.cradle.bitcoin.getTx({ txid });
-      return true;
-    } catch {
-      return false;
+      return 'found';
+    } catch (err) {
+      if (err instanceof BitcoinClientAPIError && err.statusCode === HttpStatusCode.NotFound) {
+        return 'missing';
+      }
+      return 'unknown';
     }
   }
 
@@ -1419,7 +1454,25 @@ export default class TransactionProcessor
       rebroadcastErrors.every(isBtcTxRejectedError) &&
       Date.now() - submission.createdAt >= SUBMISSION_MAX_RECOVERY_TIME
     ) {
-      const rejectedError = new SubmittedTransactionRejectedError(txid, rebroadcastErrors[0].message);
+      // only give up on a confirmed 404, the earlier one may be stale (e.g. "already in block chain")
+      const lookup = await this.lookupBtcTx(txid);
+      if (lookup === 'found') {
+        await this.moveJobToDelayed(job, token, undefined, this.cradle.env.TRANSACTION_QUEUE_JOB_DELAY);
+        return;
+      }
+      if (lookup === 'unknown') {
+        await this.moveJobToDelayed(job, token, rebroadcastErrors[0], this.getSubmissionRetryDelay(submission));
+        return;
+      }
+      // lets the failed listener retry if a newer version was saved during this run
+      await this.cradle.redis.eval(
+        SET_SUBMISSION_FIELD_SCRIPT,
+        1,
+        this.getSubmissionKey(txid),
+        SUBMISSION_CHECKED_SEQ_FIELD,
+        submission.seq,
+      );
+      const rejectedError = new SubmittedTransactionRejectedError(txid, getErrorMessage(rebroadcastErrors[0]));
       await this.recordJobError(job, rejectedError);
       this.cradle.logger.warn(`[TransactionProcessor] ${rejectedError.message}`);
       throw new UnrecoverableError(rejectedError.message);

@@ -121,7 +121,8 @@ const transactionRoute: FastifyPluginCallback<Record<never, never>, Server, ZodT
       return {
         btc_txid: job.data.txid,
         state,
-        broadcast_status: broadcastError ? ('pending' as const) : ('sent' as const),
+        // an empty error still means the outcome is unknown
+        broadcast_status: broadcastError === undefined ? ('sent' as const) : ('pending' as const),
         broadcast_error: broadcastError,
       };
     },

@@ -206,6 +206,48 @@ describe('/rgbpp/v1/transaction', () => {
     await fastify.close();
   });
 
+  test('Submit transaction with an empty broadcast error', async () => {
+    const fastify = buildFastify();
+    await fastify.ready();
+
+    const ckbVirtualResult = {
+      ...mockCkbVirtualResult,
+      commitment: calculateCommitment(mockCkbVirtualResult.ckbRawTx),
+    };
+    const { txid, btcTxHex } = buildBtcTx(ckbVirtualResult.commitment);
+    const transactionProcessor: TransactionProcessor = fastify.container.resolve('transactionProcessor');
+    vi.spyOn(transactionProcessor, 'submitTransaction').mockResolvedValueOnce({
+      job: {
+        data: { txid, ckbVirtualResult },
+        getState: vi.fn().mockResolvedValue('delayed'),
+      } as unknown as Job<ITransactionRequest>,
+      broadcastError: '',
+    });
+
+    const response = await fastify.inject({
+      method: 'POST',
+      url: '/rgbpp/v1/transaction/submit',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Origin: 'https://test.com',
+      },
+      body: {
+        btc_tx_hex: btcTxHex,
+        ckb_virtual_result: ckbVirtualResult,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      btc_txid: txid,
+      state: 'delayed',
+      broadcast_status: 'pending',
+      broadcast_error: '',
+    });
+
+    await fastify.close();
+  });
+
   test('Submit transaction with invalid btc_tx_hex', async () => {
     const fastify = buildFastify();
     await fastify.ready();
