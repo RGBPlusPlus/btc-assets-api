@@ -2,6 +2,7 @@ import { cloneDeep } from 'lodash';
 import { opReturnScriptPubKeyToData } from '@rgbpp-sdk/btc';
 import { calculateCommitment } from '@rgbpp-sdk/ckb';
 import { RGBPP_TX_ID_PLACEHOLDER, BTCTimeLock, buildPreLockArgs, genBtcTimeLockArgs } from '@rgbpp-sdk/ckb';
+import { Transaction as BitcoinTransaction, opcodes } from 'bitcoinjs-lib';
 import { Transaction } from '../routes/bitcoin/types';
 import { isBtcTimeLock, isRgbppLock } from './lockscript';
 
@@ -24,6 +25,19 @@ export function getCommitmentFromBtcTx(tx: Transaction): Buffer {
   }
   const buffer = Buffer.from(opReturn.scriptpubkey, 'hex');
   return opReturnScriptPubKeyToData(buffer);
+}
+
+/**
+ * Get commitment from a raw Bitcoin transaction, e.g. one that hasn't been broadcast yet
+ * depended on @rgbpp-sdk/btc opReturnScriptPubKeyToData method
+ * @param tx - Bitcoin transaction parsed from hex
+ */
+export function getCommitmentFromRawBtcTx(tx: BitcoinTransaction): Buffer {
+  const opReturn = tx.outs.find((out) => out.script[0] === opcodes.OP_RETURN);
+  if (!opReturn) {
+    throw new OpReturnNotFoundError(tx.getId());
+  }
+  return opReturnScriptPubKeyToData(opReturn.script);
 }
 
 /**
