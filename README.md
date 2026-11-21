@@ -165,3 +165,30 @@ docker-compose up
 ```
 
 After the service is running, you can access the API documentation at `http://localhost:3000/docs`
+
+## End-to-end tests
+
+Run these read-only HTTP checks against a **running Asset API** using any supported Bitcoin backend. They do not start the server, broadcast transactions, flush Redis, or run as part of the default unit tests. The API can still perform its normal cache and queue updates during these reads.
+
+Use Node.js 20 or newer and a quiet address with a known confirmed, currently unspent output. Verify the fixture outpoint and amount independently (for example, with Bitcoin Core's `gettxout` for that outpoint); do not copy them from the API under test.
+
+```sh
+export E2E_ASSET_API_URL=http://localhost:3000
+export E2E_BTC_NETWORK=testnet # mainnet, testnet (Testnet3), or signet
+export E2E_BTC_ADDRESS='<BTC address>'
+export E2E_BTC_OUTPOINT='<txid>:<decimal vout>'
+export E2E_BTC_VALUE_SATS='<amount in satoshis>'
+pnpm test:e2e
+```
+
+The suite checks service health, the Bitcoin genesis and tip response, the confirmed fixture UTXO, and inclusive/exclusive value filtering. It bypasses the address UTXO cache and checks that the Bitcoin tip and the address's UTXOs are stable across the filter requests.
+
+Optional checks and configuration:
+
+- For an authenticated API, supply `E2E_ASSET_API_JWT` securely in your local environment and set `E2E_ASSET_API_ORIGIN` to the origin matching the JWT audience. Bearer authentication requires HTTPS or literal loopback (`127.0.0.1` or `::1`); redirects are not followed.
+- Set `E2E_BTC_UNCONFIRMED_OUTPOINT=<txid>:<decimal vout>` to verify that a separately known mempool output at the same address is returned only without the confirmation filter. Otherwise this check is skipped.
+- Set `E2E_BTC_MIN_UTXOS=501` and use a fixture known to have at least 501 current UTXOs to detect truncation. Use an ordinary fixture on backends that enforce an address limit.
+- Set `E2E_BLOCKBOOK_URL` to the base URL of a synced Blockbook instance on the same chain to compare the exact outpoints, satoshi values, and confirmed/mempool status. The oracle's indexed tip must match the Asset API, and the fixture should not be changing in the mempool. If the API uses this same Blockbook instance, the comparison verifies mapping, not correctness of the index itself.
+- For an RGB++ fixture, set `E2E_RGBPP_OUTPOINT=0x<CKB tx hash>:0x<index>` to check that the corresponding live cell is returned from the address assets endpoint. Use a small fixture here to avoid expensive CKB lookups.
+
+Use `pnpm test:e2e:fixture` to exercise the runner against a disposable loopback fixture without a running Asset API.
