@@ -21,6 +21,8 @@ const MAX_UINT32 = 0xffffffff;
 const Uint32 = z.number().int().min(0).max(MAX_UINT32);
 const CHAIN_PAGE_SIZE = 25;
 const MEMPOOL_PAGE_SIZE = 50;
+const MEMPOOL_SCAN_PAGE_SIZE = 1_000;
+const MAX_MEMPOOL_SCAN_PAGES = 100;
 const IN_BLOCK_PAGE_SIZE = 1_000;
 const MAX_IN_BLOCK_PAGES = 20;
 const BlockbookTx = z.object({
@@ -54,6 +56,8 @@ const BlockbookUtxos = z.array(
     }),
 );
 
+type AddressTxids = { pending: string[]; confirmed: string[] };
+
 export class BlockbookInputError extends Error {
   constructor(
     message: string,
@@ -61,6 +65,15 @@ export class BlockbookInputError extends Error {
   ) {
     super(message);
     this.name = 'BlockbookInputError';
+  }
+}
+
+export class BlockbookHistoryLimitError extends Error {
+  public readonly statusCode = 503;
+
+  constructor() {
+    super('Blockbook cannot return the full pending address history within its pagination limit');
+    this.name = 'BlockbookHistoryLimitError';
   }
 }
 
@@ -177,32 +190,25 @@ export class BlockbookClient implements Pick<IBitcoinDataProvider, 'getAddressTx
   private async getAddressTxids(
     { address, after_txid }: { address: string; after_txid?: string },
     signal: AbortSignal,
-  ): Promise<string[]> {
+  ): Promise<AddressTxids> {
     if (!after_txid) {
       const first = await this.readAddressPage(address, 1, CHAIN_PAGE_SIZE + MEMPOOL_PAGE_SIZE, signal);
       const pending = first.txids.slice(0, Math.min(first.unconfirmedTxs, MEMPOOL_PAGE_SIZE));
-      let confirmed = first.txids.slice(first.unconfirmedTxs, first.unconfirmedTxs + CHAIN_PAGE_SIZE);
-      // Some Blockbook releases page one combined sequence; older releases prepend all mempool
-      // txids to the first confirmed page. If pending ids filled the window, read chain only.
-      if (confirmed.length < Math.min(first.txs, CHAIN_PAGE_SIZE)) {
-        const chain = await this.readAddressPage(address, 1, CHAIN_PAGE_SIZE, signal, { to: MAX_UINT32 });
-        confirmed = chain.txids;
-      }
-
-      const result = [...pending, ...confirmed];
-      if (
-        pending.length !== Math.min(first.unconfirmedTxs, MEMPOOL_PAGE_SIZE) ||
-        confirmed.length !== Math.min(first.txs, CHAIN_PAGE_SIZE) ||
-        new Set(result).size !== result.length
-      ) {
+      if (pending.length !== Math.min(first.unconfirmedTxs, MEMPOOL_PAGE_SIZE)) {
         throw new Error('Blockbook address history changed while reading the first page; retry');
       }
-      return result;
+      return { pending, confirmed: await this.getFirstConfirmedTxids(address, first, pending, signal) };
     }
 
     const cursor = inputTxid(after_txid);
     const status = await this.getTransactionStatus(cursor, signal);
-    if (!status?.confirmed || status.block_height === undefined || status.block_height < 1) {
+    if (!status) {
+      throw new BlockbookInputError('after_txid must identify a Bitcoin address transaction', 400);
+    }
+    if (!status.confirmed) {
+      return this.getAddressTxidsAfterPending(address, cursor, signal);
+    }
+    if (status.block_height === undefined || status.block_height < 1) {
       throw new BlockbookInputError('after_txid must identify a confirmed address transaction', 400);
     }
 
@@ -274,24 +280,116 @@ export class BlockbookClient implements Pick<IBitcoinDataProvider, 'getAddressTx
     if (!found) {
       throw new BlockbookInputError('after_txid does not belong to this Bitcoin address history', 400);
     }
-    return result;
+    return { pending: [], confirmed: result };
+  }
+
+  private async getFirstConfirmedTxids(
+    address: string,
+    first: z.infer<typeof BlockbookAddressPage>,
+    pending: string[],
+    signal: AbortSignal,
+  ): Promise<string[]> {
+    let confirmed = first.txids.slice(first.unconfirmedTxs, first.unconfirmedTxs + CHAIN_PAGE_SIZE);
+    // Some Blockbook releases page one combined sequence; older releases prepend all mempool
+    // txids to the first confirmed page. If pending ids filled the window, read chain only.
+    if (confirmed.length < Math.min(first.txs, CHAIN_PAGE_SIZE)) {
+      const chain = await this.readAddressPage(address, 1, CHAIN_PAGE_SIZE, signal, { to: MAX_UINT32 });
+      confirmed = chain.txids;
+    }
+
+    if (
+      confirmed.length !== Math.min(first.txs, CHAIN_PAGE_SIZE) ||
+      new Set([...pending, ...confirmed]).size !== pending.length + confirmed.length
+    ) {
+      throw new Error('Blockbook address history changed while reading the first page; retry');
+    }
+    return confirmed;
+  }
+
+  private async getAddressTxidsAfterPending(
+    address: string,
+    cursor: string,
+    signal: AbortSignal,
+  ): Promise<AddressTxids> {
+    let pageSize = CHAIN_PAGE_SIZE + MEMPOOL_PAGE_SIZE;
+    let first = await this.readAddressPage(address, 1, pageSize, signal);
+    const prefix = first.txids.slice(0, first.unconfirmedTxs);
+    const index = prefix.indexOf(cursor);
+    if (prefix.length < first.unconfirmedTxs && (index === -1 || prefix.length - index - 1 < MEMPOOL_PAGE_SIZE)) {
+      pageSize = MEMPOOL_SCAN_PAGE_SIZE;
+      const expanded = await this.readAddressPage(address, 1, pageSize, signal);
+      if (expanded.unconfirmedTxs !== first.unconfirmedTxs || prefix.some((txid, i) => txid !== expanded.txids[i])) {
+        throw new Error('Blockbook address history changed while reading a mempool cursor; retry');
+      }
+      first = expanded;
+    }
+
+    const count = first.unconfirmedTxs;
+    // v0.6 prepends mempool txids only on page one, truncates that page, and reports
+    // the confirmed page count. In the combined layout, a full pending page adds
+    // at least one to that count; v0.4 returns the whole pending prefix on page one.
+    const hasTruncatedPrefix =
+      count > pageSize &&
+      first.txids.length === pageSize &&
+      first.totalPages === Math.max(1, Math.ceil(first.txs / pageSize));
+    const available = hasTruncatedPrefix ? pageSize : Math.min(count, pageSize * MAX_MEMPOOL_SCAN_PAGES);
+    const pending: string[] = [];
+    const seen = new Set<string>();
+    let found = false;
+    for (let page = 1; (page - 1) * pageSize < available; page++) {
+      const current = page === 1 ? first : await this.readAddressPage(address, page, pageSize, signal);
+      const remaining = available - (page - 1) * pageSize;
+      const pagePending = current.txids.slice(0, remaining);
+      // Legacy first pages can contain the entire pending prefix. Combined pages must contain
+      // exactly their pending slots; a clamped page, changed count, or repetition means retry.
+      if (
+        current.page !== page ||
+        current.unconfirmedTxs !== count ||
+        pagePending.length < Math.min(remaining, pageSize) ||
+        (page > 1 && current.txids.length > pageSize)
+      ) {
+        throw new Error('Blockbook address history changed while reading a mempool cursor; retry');
+      }
+      for (const txid of pagePending) {
+        if (seen.has(txid)) {
+          throw new Error('Blockbook returned duplicate address history while reading a mempool cursor; retry');
+        }
+        seen.add(txid);
+        if (found) pending.push(txid);
+        if (txid === cursor) found = true;
+        if (pending.length === MEMPOOL_PAGE_SIZE) break;
+      }
+      if (pending.length === MEMPOOL_PAGE_SIZE || pagePending.length === remaining) break;
+    }
+    if (pending.length < MEMPOOL_PAGE_SIZE && available < count) {
+      throw new BlockbookHistoryLimitError();
+    }
+    if (!found) {
+      throw new BlockbookInputError('after_txid does not belong to this Bitcoin address history', 400);
+    }
+    const confirmed = await this.getFirstConfirmedTxids(address, first, pending, signal);
+    if (confirmed.some((txid) => seen.has(txid))) {
+      throw new Error('Blockbook address history changed while reading a mempool cursor; retry');
+    }
+    return { pending, confirmed };
   }
 
   public async getAddressTxs(
     request: { address: string; after_txid?: string },
     hydrate: (txid: string) => Promise<Transaction>,
   ): Promise<Transaction[]> {
-    const txids = await this.getAddressTxids(request, AbortSignal.timeout(20_000));
-    return Promise.all(
-      txids.map((txid) =>
-        this.hydrateLimit(async () => {
-          const tx = await hydrate(txid);
-          if (tx.txid !== txid || (request.after_txid && !tx.status.confirmed)) {
-            throw new Error('Bitcoin history transaction did not match the selected transaction; retry');
-          }
-          return tx;
-        }),
-      ),
-    );
+    const { pending, confirmed } = await this.getAddressTxids(request, AbortSignal.timeout(20_000));
+    const load = (txid: string, requireConfirmed: boolean) =>
+      this.hydrateLimit(async () => {
+        const tx = await hydrate(txid);
+        if (tx.txid !== txid || (requireConfirmed && !tx.status.confirmed)) {
+          throw new Error('Bitcoin history transaction did not match the selected transaction; retry');
+        }
+        return tx;
+      });
+    return Promise.all([
+      ...pending.map((txid) => load(txid, false)),
+      ...confirmed.map((txid) => load(txid, Boolean(request.after_txid))),
+    ]);
   }
 }

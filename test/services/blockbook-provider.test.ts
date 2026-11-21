@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 import type { Cradle } from '../../src/container';
 import { NetworkType } from '../../src/constants';
 import BitcoinClient, { BitcoinClientAPIError } from '../../src/services/bitcoin';
+import { BlockbookHistoryLimitError } from '../../src/services/bitcoin/blockbook';
 import { BitcoinCoreRPCError } from '../../src/services/bitcoin/core';
 
 const testnet3 = '000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943';
@@ -62,6 +63,13 @@ vi.mock('../../src/services/bitcoin/core', () => {
 
 vi.mock('../../src/services/bitcoin/blockbook', () => ({
   BlockbookInputError: class extends Error {},
+  BlockbookHistoryLimitError: class extends Error {
+    statusCode = 503;
+
+    constructor() {
+      super('Blockbook cannot return the full pending address history within its pagination limit');
+    }
+  },
   BlockbookClient: class {
     constructor(url: string) {
       calls.blockbook(url);
@@ -165,5 +173,15 @@ describe('Full Blockbook/Core backend routing', () => {
     const error = await client.getTx({ txid }).catch((err: unknown) => err);
     expect(error).toBeInstanceOf(BitcoinClientAPIError);
     expect(error).toMatchObject({ statusCode: 404, message: 'not found' });
+  });
+
+  test('preserves the explanation when Blockbook cannot continue pending address history', async () => {
+    const client = makeClient();
+    const message = 'Blockbook cannot return the full pending address history within its pagination limit';
+    calls.getAddressTxs.mockRejectedValueOnce(new BlockbookHistoryLimitError());
+    await expect(client.getAddressTxs({ address, after_txid: txid })).rejects.toMatchObject({
+      statusCode: 503,
+      message,
+    });
   });
 });

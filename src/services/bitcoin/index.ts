@@ -6,7 +6,7 @@ import { Cradle } from '../../container';
 import { IBitcoinBroadcastBackuper, IBitcoinDataProvider } from './interface';
 import { MempoolClient } from './mempool';
 import { ElectrsClient } from './electrs';
-import { BlockbookClient, BlockbookInputError } from './blockbook';
+import { BlockbookClient, BlockbookHistoryLimitError, BlockbookInputError } from './blockbook';
 import { BitcoinCoreClient, BitcoinCoreRPCError } from './core';
 import { blockbookCoreProvider } from './blockbook-core';
 import { IS_MAINNET, NetworkType } from '../../constants';
@@ -146,7 +146,11 @@ export default class BitcoinClient implements IBitcoinClient {
       return result as MethodReturnType<IBitcoinDataProvider, K>;
     } catch (err) {
       if (this.core) {
-        if (err instanceof BitcoinCoreRPCError || err instanceof BlockbookInputError) {
+        if (
+          err instanceof BitcoinCoreRPCError ||
+          err instanceof BlockbookInputError ||
+          err instanceof BlockbookHistoryLimitError
+        ) {
           const error = new BitcoinClientAPIError(err.message);
           error.statusCode = err.statusCode;
           throw error;

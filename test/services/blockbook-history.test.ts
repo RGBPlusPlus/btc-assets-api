@@ -106,6 +106,133 @@ describe('Blockbook history and transaction status', () => {
     expect(hydrate).not.toHaveBeenCalled();
   });
 
+  function pendingHistoryFixture(
+    pending: string[],
+    confirmed: string[],
+    layout: 'combined' | 'prepended' | 'capped' = 'combined',
+  ) {
+    adapter.mockImplementation(async (config) => {
+      if (config.url.startsWith('/api/v2/tx/')) {
+        return reply(config, { txid: config.url.slice('/api/v2/tx/'.length), confirmations: 0 });
+      }
+      expect(config.url).toBe('/api/v2/address/' + address);
+      const { details, page, pageSize, to } = config.params;
+      expect(details).toBe('txids');
+      const sequence = to === undefined && layout === 'combined' ? [...pending, ...confirmed] : confirmed;
+      const totalPages = Math.max(1, Math.ceil(sequence.length / pageSize));
+      const actualPage = Math.min(page, totalPages);
+      let txids = sequence.slice((actualPage - 1) * pageSize, actualPage * pageSize);
+      if (layout !== 'combined' && to === undefined && actualPage === 1) {
+        txids = [...pending, ...txids];
+        if (layout === 'capped') txids = txids.slice(0, pageSize);
+      }
+      return reply(config, {
+        page: actualPage,
+        itemsOnPage: pageSize,
+        totalPages,
+        txs: confirmed.length,
+        unconfirmedTxs: to === undefined ? pending.length : 0,
+        txids,
+      });
+    });
+  }
+
+  test.each([true, false])('pending cursor continues into confirmed history; combined paging: %s', async (combined) => {
+    const pending = [hash(20_002), cursor, hash(20_001), hash(20_000)];
+    const confirmed = Array.from({ length: 30 }, (_, i) => hash(30_000 - i));
+    pendingHistoryFixture(pending, confirmed, combined ? 'combined' : 'prepended');
+    const hydrate = vi.fn(async (txid: string) => transaction(txid, confirmed.includes(txid)));
+    const result = await createClient().getAddressTxs({ address, after_txid: cursor }, hydrate);
+    expect(result.map(({ txid }) => txid)).toEqual([...pending.slice(2), ...confirmed.slice(0, 25)]);
+    expect(result.map(({ status }) => status.confirmed)).toEqual([false, false, ...Array(25).fill(true)]);
+    expect(hydrate).not.toHaveBeenCalledWith(cursor);
+    expect(adapter.mock.calls.filter(([config]) => config.params?.pageSize === 1000)).toHaveLength(0);
+  });
+
+  test('all cursors round-trip through a large combined pending history, including its empty tail', async () => {
+    const pending = Array.from({ length: 1_058 }, (_, i) => hash(40_000 - i));
+    pendingHistoryFixture(pending, []);
+    const book = createClient();
+    const hydrate = vi.fn(async (txid: string) => transaction(txid, false));
+    let after_txid: string | undefined;
+    for (let i = 0; i <= pending.length; i += 50) {
+      const page = await book.getAddressTxs({ address, after_txid }, hydrate);
+      expect(page.map(({ txid }) => txid)).toEqual(pending.slice(i, i + 50));
+      after_txid = page[page.length - 1]?.txid;
+    }
+    await expect(book.getAddressTxs({ address, after_txid }, hydrate)).resolves.toEqual([]);
+    expect(adapter.mock.calls.some(([config]) => config.params?.page === 2)).toBe(true);
+    expect(hydrate).toHaveBeenCalledTimes(pending.length);
+  });
+
+  test.each([true, false])(
+    'finds a deep pending cursor and retrieves confirmed history; combined paging: %s',
+    async (combined) => {
+      const pending = Array.from({ length: 1_005 }, (_, i) => hash(40_000 - i));
+      const confirmed = Array.from({ length: 30 }, (_, i) => hash(30_000 - i));
+      pendingHistoryFixture(pending, confirmed, combined ? 'combined' : 'prepended');
+      const hydrate = vi.fn(async (txid: string) => transaction(txid, confirmed.includes(txid)));
+      const result = await createClient().getAddressTxs({ address, after_txid: pending[1_002] }, hydrate);
+      expect(result.map(({ txid }) => txid)).toEqual([...pending.slice(1_003), ...confirmed.slice(0, 25)]);
+      expect(adapter.mock.calls.filter(([config]) => config.params?.to === 0xffffffff)).toHaveLength(combined ? 1 : 0);
+      expect(adapter.mock.calls.filter(([config]) => config.params?.page === 2)).toHaveLength(combined ? 1 : 0);
+    },
+  );
+
+  test.each([82, 1_000])('supports cursors through the last pending entry on Blockbook v0.6: %s', async (count) => {
+    const pending = Array.from({ length: count }, (_, i) => hash(40_000 - i));
+    pendingHistoryFixture(pending, [], 'capped');
+    const book = createClient();
+    const hydrate = vi.fn(async (txid: string) => transaction(txid, false));
+    const afterPenultimate = await book.getAddressTxs({ address, after_txid: pending[count - 2] }, hydrate);
+    expect(afterPenultimate.map(({ txid }) => txid)).toEqual(pending.slice(-1));
+    await expect(book.getAddressTxs({ address, after_txid: pending[count - 1] }, hydrate)).resolves.toEqual([]);
+    expect(adapter.mock.calls.filter(([config]) => config.params?.page === 2)).toHaveLength(0);
+  });
+
+  test('does not silently skip pending rows hidden by the v0.6 REST cap or misreport their membership', async () => {
+    const pending = Array.from({ length: 1_005 }, (_, i) => hash(40_000 - i));
+    const confirmed = [hash(30_000)];
+    pendingHistoryFixture(pending, confirmed, 'capped');
+    const hydrate = vi.fn();
+    const book = createClient();
+    for (const after_txid of [pending[999], pending[1_001]]) {
+      await expect(book.getAddressTxs({ address, after_txid }, hydrate)).rejects.toMatchObject({
+        statusCode: 503,
+        message: expect.stringContaining('pagination limit'),
+      });
+    }
+    expect(adapter.mock.calls.filter(([config]) => config.params?.page === 2)).toHaveLength(0);
+    expect(hydrate).not.toHaveBeenCalled();
+  });
+
+  test('rejects a pending cursor that is not in this address history', async () => {
+    pendingHistoryFixture([hash(20_000)], [hash(30_000)]);
+    const hydrate = vi.fn();
+    await expect(createClient().getAddressTxs({ address, after_txid: cursor }, hydrate)).rejects.toMatchObject({
+      statusCode: 400,
+      message: expect.stringContaining('does not belong'),
+    });
+    expect(hydrate).not.toHaveBeenCalled();
+  });
+
+  test('fails before hydration when the pending count changes during a scan', async () => {
+    const pending = Array.from({ length: 1_005 }, (_, i) => hash(40_000 - i));
+    pendingHistoryFixture(pending, []);
+    const lookup = adapter.getMockImplementation()!;
+    adapter.mockImplementation(async (config) => {
+      const result = await lookup(config);
+      if (config.params?.page === 2) result.data.unconfirmedTxs -= 1;
+      return result;
+    });
+    const hydrate = vi.fn();
+    await expect(createClient().getAddressTxs({ address, after_txid: pending[1_002] }, hydrate)).rejects.toThrow(
+      'address history changed while reading a mempool cursor',
+    );
+    expect(hydrate).not.toHaveBeenCalled();
+    expect(adapter.mock.calls.filter(([config]) => config.params?.page === 2)).toHaveLength(1);
+  });
+
   function historyFixture(sameBlock: string[], older: string[], changeBlock = false) {
     adapter.mockImplementation(async (config) => {
       if (config.url === '/api/v2/tx/' + cursor) return reply(config, blockbookTx(cursor));
