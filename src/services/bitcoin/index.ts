@@ -6,6 +6,9 @@ import { Cradle } from '../../container';
 import { IBitcoinBroadcastBackuper, IBitcoinDataProvider } from './interface';
 import { MempoolClient } from './mempool';
 import { ElectrsClient } from './electrs';
+import { BlockbookClient, BlockbookInputError } from './blockbook';
+import { BitcoinCoreClient, BitcoinCoreRPCError } from './core';
+import { blockbookCoreProvider } from './blockbook-core';
 import { IS_MAINNET, NetworkType } from '../../constants';
 import { ChainInfo } from './schema';
 
@@ -59,12 +62,17 @@ export default class BitcoinClient implements IBitcoinClient {
   private cradle: Cradle;
   private source: IBitcoinDataProvider;
   private fallback?: IBitcoinDataProvider;
+  private blockbook?: BlockbookClient;
+  private core?: BitcoinCoreClient;
   private backupers: IBitcoinBroadcastBackuper[] = [];
 
   constructor(cradle: Cradle) {
     this.cradle = cradle;
 
     const { env } = cradle;
+    if (env.BITCOIN_BLOCKBOOK_API_URL) {
+      this.blockbook = new BlockbookClient(env.BITCOIN_BLOCKBOOK_API_URL);
+    }
     switch (env.BITCOIN_DATA_PROVIDER) {
       case 'mempool':
         this.cradle.logger.info('Using Mempool.space API as the bitcoin data provider');
@@ -82,14 +90,31 @@ export default class BitcoinClient implements IBitcoinClient {
           this.fallback = new MempoolClient(env.BITCOIN_MEMPOOL_SPACE_API_URL, cradle);
         }
         break;
+      case 'blockbook':
+        if (!this.blockbook) {
+          throw new Error('Blockbook URL required for the Blockbook provider');
+        }
+        this.cradle.logger.info('Using Blockbook and Bitcoin Core as the Bitcoin data provider');
+        this.core = new BitcoinCoreClient({
+          url: env.BITCOIN_CORE_RPC_URL,
+          username: env.BITCOIN_CORE_RPC_USERNAME,
+          password: env.BITCOIN_CORE_RPC_PASSWORD,
+        });
+        this.source = blockbookCoreProvider(this.core, this.blockbook);
+        break;
       default:
         throw new Error('Invalid bitcoin data provider');
+    }
+
+    if (this.blockbook && !this.core) {
+      this.cradle.logger.info('Using Blockbook API for Bitcoin address UTXOs');
     }
 
     if (this.fallback) {
       this.backupers.push(this.fallback);
     }
     if (
+      !this.core &&
       env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST &&
       env.BITCOIN_ADDITIONAL_BROADCAST_ELECTRS_URL_LIST.length > 0
     ) {
@@ -120,6 +145,14 @@ export default class BitcoinClient implements IBitcoinClient {
       const result = await (source[method] as Function).apply(source, args);
       return result as MethodReturnType<IBitcoinDataProvider, K>;
     } catch (err) {
+      if (this.core) {
+        if (err instanceof BitcoinCoreRPCError || err instanceof BlockbookInputError) {
+          const error = new BitcoinClientAPIError(err.message);
+          error.statusCode = err.statusCode;
+          throw error;
+        }
+        throw this.blockbookError(method, err);
+      }
       let calledError = err;
       this.cradle.logger.error(err);
       Sentry.captureException(err);
@@ -181,6 +214,36 @@ export default class BitcoinClient implements IBitcoinClient {
         break;
       default:
     }
+    if (this.blockbook) {
+      const blockbookHash = await this.blockbook.getGenesisHash().catch(() => {
+        throw new Error('Could not verify the Blockbook Bitcoin network');
+      });
+      if (blockbookHash !== hash) {
+        throw new Error('Blockbook is not running on the configured Bitcoin network');
+      }
+    }
+  }
+
+  public async checkCoreReady(): Promise<void> {
+    await this.core?.checkReady();
+  }
+
+  private blockbookError(action: string, err: unknown): BitcoinClientAPIError {
+    const reason = isAxiosError(err) ? (err.response?.status ?? err.code ?? 'request failed') : 'invalid response';
+    const error = new BitcoinClientAPIError(
+      BitcoinClientErrorMessage.Connection + ': Blockbook ' + action + ' failed (' + reason + ')',
+    );
+    this.cradle.logger.error(error);
+    Sentry.captureException(error);
+    return error;
+  }
+
+  public async getBlockbookTransactionStatus(txid: string) {
+    try {
+      return await this.blockbook?.getTransactionStatus(txid);
+    } catch (err) {
+      throw this.blockbookError('transaction status lookup', err);
+    }
   }
 
   public async getBlockchainInfo(): Promise<ChainInfo> {
@@ -220,7 +283,22 @@ export default class BitcoinClient implements IBitcoinClient {
   }
 
   public async getAddressTxsUtxo({ address }: { address: string }) {
-    return this.call('getAddressTxsUtxo', { address });
+    if (!this.blockbook) {
+      return this.call('getAddressTxsUtxo', { address });
+    }
+
+    try {
+      return await this.blockbook.getAddressTxsUtxo({ address });
+    } catch (err) {
+      // Do not silently retry on a provider that may reject large addresses.
+      const reason = isAxiosError(err) ? (err.response?.status ?? err.code ?? 'request failed') : 'invalid response';
+      const error = new BitcoinClientAPIError(
+        BitcoinClientErrorMessage.Connection + ': Blockbook UTXO lookup failed (' + reason + ')',
+      );
+      this.cradle.logger.error(error);
+      Sentry.captureException(error);
+      throw error;
+    }
   }
 
   public async getAddressTxs({ address, after_txid }: { address: string; after_txid?: string }) {

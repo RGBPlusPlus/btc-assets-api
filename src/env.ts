@@ -3,6 +3,20 @@ import z from 'zod';
 import process from 'node:process';
 import { omit } from 'lodash';
 
+const httpUrl = z
+  .string()
+  .trim()
+  .url()
+  .refine((value) => /^https?:\/\//i.test(value), 'URL must use HTTP or HTTPS');
+const coreRpcUrl = httpUrl.refine((value) => {
+  try {
+    const url = new URL(value);
+    return !url.username && !url.password && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}, 'Use separate Bitcoin Core RPC credentials; the URL must not contain credentials, a query, or a fragment');
+
 const envSchema = z
   .object({
     NODE_ENV: z.string().default('development'),
@@ -87,6 +101,11 @@ const envSchema = z
      * https://github.com/ckb-cell/ckb-bitcoin-spv-service
      */
     BITCOIN_SPV_SERVICE_URL: z.string(),
+
+    /**
+     * Blockbook base URL: required for the full provider, optional for legacy UTXO override.
+     */
+    BITCOIN_BLOCKBOOK_API_URL: httpUrl.optional(),
 
     /**
      * Bitcoin additional broadcast electrs URL list
@@ -281,6 +300,22 @@ const envSchema = z
         BITCOIN_MEMPOOL_SPACE_API_URL: z.string().optional(),
         BITCOIN_DATA_PROVIDER: z.literal('electrs').default('electrs'),
       }),
+      z
+        .object({
+          BITCOIN_DATA_PROVIDER: z.literal('blockbook'),
+          BITCOIN_BLOCKBOOK_API_URL: httpUrl,
+          BITCOIN_CORE_RPC_URL: coreRpcUrl,
+          BITCOIN_CORE_RPC_USERNAME: z.string().min(1).optional(),
+          BITCOIN_CORE_RPC_PASSWORD: z.string().min(1).optional(),
+        })
+        .refine(
+          (value) =>
+            (value.BITCOIN_CORE_RPC_USERNAME === undefined) === (value.BITCOIN_CORE_RPC_PASSWORD === undefined),
+          {
+            message: 'Set both Bitcoin Core RPC username and password, or neither for an authenticated private proxy',
+            path: ['BITCOIN_CORE_RPC_PASSWORD'],
+          },
+        ),
     ]),
   );
 
@@ -288,6 +323,15 @@ export type Env = z.infer<typeof envSchema>;
 export const env = envSchema.parse(process.env);
 
 export const getSafeEnvs = () =>
-  omit(env, ['ADMIN_PASSWORD', 'JWT_SECRET', 'BITCOIN_JSON_RPC_PASSWORD', 'PAYMASTER_PRIVATE_KEY']);
+  omit(env, [
+    'ADMIN_PASSWORD',
+    'JWT_SECRET',
+    'BITCOIN_JSON_RPC_PASSWORD',
+    'BITCOIN_BLOCKBOOK_API_URL',
+    'BITCOIN_CORE_RPC_URL',
+    'BITCOIN_CORE_RPC_USERNAME',
+    'BITCOIN_CORE_RPC_PASSWORD',
+    'PAYMASTER_PRIVATE_KEY',
+  ]);
 
 export const isAdminMode = env.NODE_ENV === 'production' && env.ADMIN_USERNAME && env.ADMIN_PASSWORD;

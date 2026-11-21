@@ -93,7 +93,7 @@ JWT_SECRET=<your_secret>
 # JWT token denylist
 # JWT_DENYLIST=
 
-# Bitcoin data provider, support mempool and electrs
+# Bitcoin data provider: electrs, mempool, or blockbook (requires Bitcoin Core RPC)
 # use electrs as default, mempool as fallback
 # change to mempool if you want to use mempool.space as default and electrs as fallback
 BITCOIN_DATA_PROVIDER=electrs
@@ -103,6 +103,8 @@ BITCOIN_MEMPOOL_SPACE_API_URL=https://mempool.space
 # Electrs API URL
 # optinal when BITCOIN_DATA_PROVIDER=mempool
 BITCOIN_ELECTRS_API_URL=<http://electrs:3002>
+# Optional: use a synced Blockbook instance only for Bitcoin address UTXOs
+# BITCOIN_BLOCKBOOK_API_URL=http://blockbook:19130
 
 # SPV Service URL
 BITCOIN_SPV_SERVICE_URL=<http://spv:3001>
@@ -135,7 +137,24 @@ TRANSACTION_QUEUE_JOB_ATTEMPTS=6
 TRANSACTION_PAY_FOR_MIN_FEE_RATE_REJECT=false
 ```
 
-More configuration options can be found in the `src/env.ts` file.
+### Self-host with Blockbook and Bitcoin Core
+
+Use `blockbook` to run without Electrs or Mempool.space. Example for Bitcoin Testnet3:
+
+```dotenv
+NETWORK=testnet
+BITCOIN_DATA_PROVIDER=blockbook
+BITCOIN_BLOCKBOOK_API_URL=http://blockbook:19130
+BITCOIN_CORE_RPC_URL=http://bitcoind:18332
+BITCOIN_CORE_RPC_USERNAME=<rpc_user>
+BITCOIN_CORE_RPC_PASSWORD=<rpc_password>
+```
+
+Adjust the ports to match your deployment. Use the Blockbook service base URL without `/api/v2`. Use synced Bitcoin Core 31+ with `txindex=1`, `txospenderindex=1`, and `prune=0`, and a fully indexed Blockbook with mempool indexing. Point Blockbook and the Asset API to the same Core when possible. The API checks that both services are on the configured network at startup. Keep RPC private; set both credentials, or omit both only when a private proxy authenticates upstream. `/healthcheck` probes Core's chain and both indexes and Blockbook's chain and mempool sync.
+
+Blockbook serves address UTXOs and indexes address history. Core supplies transaction details, fees, canonical block and header data for SPV, exact confirmed and mempool spends, and broadcast. Core needs the additional spender index for exact spending outpoints, not a separate Bitcoin node. This mode does not use legacy Bitcoin providers or additional Electrs broadcast targets. The separate `BITCOIN_SPV_SERVICE_URL`, Redis, and CKB requirements are unchanged.
+
+To override only UTXOs and keep the rest on Electrs or Mempool, keep the existing `BITCOIN_DATA_PROVIDER` and set only `BITCOIN_BLOCKBOOK_API_URL`. In both modes, a live UTXO query returns the entire list including mempool changes; it is not paginated and omits optional `block_hash` and `block_time`. Sync jobs refresh directly from Blockbook rather than address history; sync jobs and snapshots are separate from the legacy backend and other Blockbook endpoints. Use `no_cache=true` to test a live read.
 
 #### Docker
 

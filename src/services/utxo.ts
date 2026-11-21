@@ -7,6 +7,7 @@ import { Job, RepeatOptions } from 'bullmq';
 import * as Sentry from '@sentry/node';
 import DataCache from './base/data-cache';
 import { throttle } from 'lodash';
+import { createHash } from 'node:crypto';
 import validateBitcoinAddress from '../utils/validators';
 
 interface IUTXOSyncRequest {
@@ -16,8 +17,8 @@ interface IUTXOSyncRequest {
 interface IUTXOSyncJobReturn {
   btcAddress: string;
   utxos: UTXO[];
-  // use sha256(latest_txs_id) as the key, so we can check if the data is updated
-  txsHash: string;
+  // Legacy refresh optimization only. Blockbook snapshots are read directly from its UTXO index.
+  txsHash?: string;
 }
 
 export const UTXO_SYNCER_QUEUE_NAME = 'utxo-syncer-queue';
@@ -32,7 +33,7 @@ class UTXOSyncerError extends Error {
 /**
  * UTXOSyncer is used to sync the utxos for the btc address.
  * The utxos are stored in the cache with the btc address as the key,
- * will be resync when the btc address txs are updated.
+ * resynced directly in Blockbook mode or when address history changes in legacy mode.
  */
 export default class UTXOSyncer extends BaseQueueWorker<IUTXOSyncRequest, IUTXOSyncJobReturn> {
   private cradle: Cradle;
@@ -41,8 +42,16 @@ export default class UTXOSyncer extends BaseQueueWorker<IUTXOSyncRequest, IUTXOS
   constructor(cradle: Cradle) {
     const defaultJobOptions = UTXOSyncer.getDefaultJobOptions(cradle);
     const repeatStrategy = UTXOSyncer.getRepeatStrategy(cradle);
+    const blockbookUrl = cradle.env.BITCOIN_BLOCKBOOK_API_URL;
+    const namespace = blockbookUrl
+      ? '-blockbook-' +
+        createHash('sha256')
+          .update(JSON.stringify([cradle.env.NETWORK, blockbookUrl]))
+          .digest('hex')
+      : '';
     super({
-      name: UTXO_SYNCER_QUEUE_NAME,
+      // Keep worker jobs and cache snapshots isolated during a backend rollout.
+      name: UTXO_SYNCER_QUEUE_NAME + namespace,
       connection: cradle.redis,
       queue: {
         defaultJobOptions,
@@ -61,11 +70,11 @@ export default class UTXOSyncer extends BaseQueueWorker<IUTXOSyncRequest, IUTXOS
     });
     this.cradle = cradle;
     this.dataCache = new DataCache(cradle.redis, {
-      prefix: 'utxo-syncer-data',
+      prefix: 'utxo-syncer-data' + namespace,
       schema: z.object({
         btcAddress: z.string(),
         utxos: z.array(UTXO),
-        txsHash: z.string(),
+        txsHash: z.string().optional(),
       }),
       expire: cradle.env.UTXO_SYNC_DATA_CACHE_EXPIRE,
     });
@@ -181,6 +190,11 @@ export default class UTXOSyncer extends BaseQueueWorker<IUTXOSyncRequest, IUTXOS
           await this.queue.removeRepeatableByKey(job.repeatJobKey);
         }
         throw new Error(`Invalid btc address: ${btcAddress}`);
+      }
+
+      if (this.cradle.env.BITCOIN_BLOCKBOOK_API_URL) {
+        const utxos = await this.cradle.bitcoin.getAddressTxsUtxo({ address: btcAddress });
+        return await this.dataCache.set(btcAddress, { btcAddress, utxos });
       }
 
       const txs = await this.cradle.bitcoin.getAddressTxs({ address: btcAddress });

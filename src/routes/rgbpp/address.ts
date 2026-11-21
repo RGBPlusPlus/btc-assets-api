@@ -6,14 +6,8 @@ import { Cell, IsomorphicTransaction, Script, XUDTBalance } from './types';
 import { createActivityHandler } from './shared';
 import z from 'zod';
 import { Env } from '../../env';
-import {
-  buildPreLockArgs,
-  getXudtTypeScript,
-  isTypeAssetSupported,
-  isUtxoAirdropBadgeType,
-  unpackRgbppLockArgs,
-} from '@rgbpp-sdk/ckb';
-import { groupBy, uniq } from 'lodash';
+import { getXudtTypeScript, isTypeAssetSupported, isUtxoAirdropBadgeType, unpackRgbppLockArgs } from '@rgbpp-sdk/ckb';
+import { uniq } from 'lodash';
 import { BI } from '@ckb-lumos/lumos';
 import { UTXO } from '../../services/bitcoin/schema';
 import { Transaction as BTCTransaction } from '../bitcoin/types';
@@ -23,6 +17,7 @@ import { filterCellsByTypeScript, getTypeScript } from '../../utils/typescript';
 import { remove0x } from '@rgbpp-sdk/btc';
 import { isRgbppLock } from '../../utils/lockscript';
 import { IS_MAINNET } from '../../constants';
+import { getPendingOutputCells } from './pending-output-cells';
 
 const addressRoutes: FastifyPluginCallback<Record<never, never>, Server, ZodTypeProvider> = (fastify, _, done) => {
   const env: Env = fastify.container.resolve('env');
@@ -186,23 +181,16 @@ const addressRoutes: FastifyPluginCallback<Record<never, never>, Server, ZodType
         };
       });
 
-      // Find all unconfirmed RgbppLock XUDT outputs
-      const pendingUtxos = utxos.filter(
-        (utxo) =>
-          !utxo.status.confirmed ||
-          // include utxo that confirmed in 20 minutes to avoid missing pending xudt
-          (utxo.status.block_time && Date.now() / 1000 - utxo.status.block_time < 20 * 60),
-      );
-      const pendingUtxosGroup = groupBy(pendingUtxos, (utxo) => utxo.txid);
-      const pendingTxids = Object.keys(pendingUtxosGroup);
-      const pendingOutputCellsGroup = await Promise.all(
-        pendingTxids.map(async (txid) => {
-          const cells = await fastify.transactionProcessor.getPendingOutputCellsByTxid(txid);
-          const lockArgsSet = new Set(pendingUtxosGroup[txid].map((utxo) => buildPreLockArgs(utxo.vout)));
-          return cells.filter((cell) => lockArgsSet.has(cell.cellOutput.lock.args));
+      // Include recently confirmed Bitcoin outputs until their CKB jobs finish.
+      const pendingOutputCells = filterCellsByTypeScript(
+        await getPendingOutputCells(utxos, Date.now() / 1000, {
+          getPendingOutputCells: (txid) => fastify.transactionProcessor.getPendingOutputCellsByTxid(txid),
+          getTransactionStatus: env.BITCOIN_BLOCKBOOK_API_URL
+            ? (txid) => fastify.bitcoin.getBlockbookTransactionStatus(txid)
+            : undefined,
         }),
+        typeScript,
       );
-      const pendingOutputCells = filterCellsByTypeScript(pendingOutputCellsGroup.flat(), typeScript);
       const pendingXudtBalances = await fastify.rgbppCollector.getRgbppBalanceByCells(pendingOutputCells);
       Object.values(pendingXudtBalances).forEach(({ amount, type_hash, ...xudtInfo }) => {
         if (!xudtBalances[type_hash]) {
