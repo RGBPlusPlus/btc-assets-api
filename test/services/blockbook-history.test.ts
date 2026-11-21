@@ -51,35 +51,11 @@ describe('Blockbook history and transaction status', () => {
   });
 
   test.each([true, false])(
-    'first page caps pending at 50 and confirmed at 25; modern combined page: %s',
+    'first page leaves confirmed history for later when pending rows remain; combined paging: %s',
     async (combined) => {
       const pending = Array.from({ length: 80 }, (_, index) => hash(index + 1_000));
       const confirmed = Array.from({ length: 80 }, (_, index) => hash(index + 2_000));
-      adapter.mockImplementation(async (config) => {
-        const { page, pageSize, details, to } = config.params;
-        expect(config.url).toBe('/api/v2/address/' + address);
-        expect({ page, details }).toEqual({ page: 1, details: 'txids' });
-        if (to === undefined) {
-          expect(pageSize).toBe(75);
-          return reply(config, {
-            page,
-            itemsOnPage: pageSize,
-            totalPages: 2,
-            unconfirmedTxs: pending.length,
-            txs: confirmed.length,
-            txids: combined ? pending.slice(0, pageSize) : [...pending, ...confirmed.slice(0, pageSize)],
-          });
-        }
-        expect({ to, pageSize }).toEqual({ to: 0xffffffff, pageSize: 25 });
-        return reply(config, {
-          page,
-          itemsOnPage: pageSize,
-          totalPages: -1,
-          unconfirmedTxs: 0,
-          txs: confirmed.length,
-          txids: confirmed.slice(0, pageSize),
-        });
-      });
+      pendingHistoryFixture(pending, confirmed, combined ? 'combined' : 'prepended');
       let active = 0;
       let maximum = 0;
       const hydrate = vi.fn(async (txid: string) => {
@@ -90,10 +66,13 @@ describe('Blockbook history and transaction status', () => {
         return transaction(txid, confirmed.includes(txid));
       });
       const result = await createClient().getAddressTxs({ address }, hydrate);
-      expect(result.map(({ txid }) => txid)).toEqual([...pending.slice(0, 50), ...confirmed.slice(0, 25)]);
-      expect(hydrate).toHaveBeenCalledTimes(75);
+      expect(result.map(({ txid }) => txid)).toEqual(pending.slice(0, 50));
+      expect(hydrate).toHaveBeenCalledTimes(50);
       expect(maximum).toBe(8);
-      expect(adapter).toHaveBeenCalledTimes(combined ? 2 : 1);
+      expect(adapter).toHaveBeenCalledWith(
+        expect.objectContaining({ params: { details: 'txids', page: 1, pageSize: 75 } }),
+      );
+      expect(adapter).toHaveBeenCalledTimes(1);
     },
   );
 
@@ -179,6 +158,18 @@ describe('Blockbook history and transaction status', () => {
     },
   );
 
+  test('honors a complete v0.4 pending prefix larger than the additional-page scan cap', async () => {
+    const pending = Array.from({ length: 8_005 }, (_, i) => hash(40_000 - i));
+    const confirmed = [hash(30_000)];
+    pendingHistoryFixture(pending, confirmed, 'prepended');
+    const hydrate = vi.fn(async (txid: string) => transaction(txid, confirmed.includes(txid)));
+    const result = await createClient().getAddressTxs({ address, after_txid: pending[8_002] }, hydrate);
+    expect(result.map(({ txid }) => txid)).toEqual([...pending.slice(-2), ...confirmed]);
+    expect(adapter.mock.calls.filter(([config]) => config.params).map(([config]) => config.params)).toEqual([
+      { details: 'txids', page: 1, pageSize: 75 },
+    ]);
+  });
+
   test.each([82, 1_000])('supports cursors through the last pending entry on Blockbook v0.6: %s', async (count) => {
     const pending = Array.from({ length: count }, (_, i) => hash(40_000 - i));
     pendingHistoryFixture(pending, [], 'capped');
@@ -214,6 +205,34 @@ describe('Blockbook history and transaction status', () => {
       message: expect.stringContaining('does not belong'),
     });
     expect(hydrate).not.toHaveBeenCalled();
+    expect(adapter.mock.calls.filter(([config]) => config.url?.endsWith('/tx/' + cursor))).toHaveLength(2);
+  });
+
+  test('returns a restartable error instead of a 400 when the pending cursor confirms mid-request', async () => {
+    pendingHistoryFixture([hash(20_000)], [cursor]);
+    const lookup = adapter.getMockImplementation()!;
+    let cursorReads = 0;
+    adapter.mockImplementation(async (config) => {
+      if (config.url === '/api/v2/tx/' + cursor && ++cursorReads === 2) return reply(config, blockbookTx(cursor));
+      return lookup(config);
+    });
+    const hydrate = vi.fn();
+    await expect(createClient().getAddressTxs({ address, after_txid: cursor }, hydrate)).rejects.toMatchObject({
+      statusCode: 503,
+      message: expect.stringContaining('restart from the first page'),
+    });
+    expect(cursorReads).toBe(2);
+    expect(hydrate).not.toHaveBeenCalled();
+  });
+
+  test('does not emit a confirmed cursor when a selected pending tx confirms during hydration', async () => {
+    const pending = Array.from({ length: 51 }, (_, i) => hash(40_000 - i));
+    pendingHistoryFixture(pending, []);
+    const hydrate = vi.fn(async (txid: string) => transaction(txid, txid === pending[49]));
+    await expect(createClient().getAddressTxs({ address }, hydrate)).rejects.toMatchObject({
+      statusCode: 503,
+      message: expect.stringContaining('restart from the first page'),
+    });
   });
 
   test('fails before hydration when the pending count changes during a scan', async () => {
@@ -227,7 +246,7 @@ describe('Blockbook history and transaction status', () => {
     });
     const hydrate = vi.fn();
     await expect(createClient().getAddressTxs({ address, after_txid: pending[1_002] }, hydrate)).rejects.toThrow(
-      'address history changed while reading a mempool cursor',
+      'restart from the first page',
     );
     expect(hydrate).not.toHaveBeenCalled();
     expect(adapter.mock.calls.filter(([config]) => config.params?.page === 2)).toHaveLength(1);

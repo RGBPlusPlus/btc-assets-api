@@ -154,7 +154,9 @@ Adjust the ports to match your deployment. Use the Blockbook service base URL wi
 
 Blockbook serves address UTXOs and indexes address history. Core supplies transaction details, fees, canonical block and header data for SPV, exact confirmed and mempool spends, and broadcast. Core needs the additional spender index for exact spending outpoints, not a separate Bitcoin node. This mode does not use legacy Bitcoin providers or additional Electrs broadcast targets. The separate `BITCOIN_SPV_SERVICE_URL`, Redis, and CKB requirements are unchanged.
 
-Address history accepts both confirmed and pending transaction cursors. Blockbook releases that cap pending txids to a single REST page, such as v0.6.0, cannot enumerate beyond 1,000 pending entries. A continuation that needs the hidden entries returns HTTP 503 instead of silently skipping them.
+Address history accepts both confirmed and pending transaction cursors. Pending pages return up to 50 transactions, and confirmed history begins once no pending rows remain. If the API detects that history changed mid-request, it returns HTTP 503 with instructions to restart from the first page. A txid cursor does not record its previous confirmation state, so also restart if a pending cursor confirms between page requests and you need to include any still-pending rows.
+
+Blockbook releases that cap pending txids to a single REST page, such as v0.6.0, cannot enumerate beyond 1,000 pending entries. A continuation that needs the hidden entries returns HTTP 503 instead of silently skipping them.
 
 To override only UTXOs and keep the rest on Electrs or Mempool, keep the existing `BITCOIN_DATA_PROVIDER` and set only `BITCOIN_BLOCKBOOK_API_URL`. In both modes, a live UTXO query returns the entire list including mempool changes; it is not paginated and omits optional `block_hash` and `block_time`. Sync jobs refresh directly from Blockbook rather than address history; sync jobs and snapshots are separate from the legacy backend and other Blockbook endpoints. Use `no_cache=true` to test a live read.
 

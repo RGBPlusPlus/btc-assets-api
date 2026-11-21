@@ -68,14 +68,24 @@ export class BlockbookInputError extends Error {
   }
 }
 
-export class BlockbookHistoryLimitError extends Error {
+export class BlockbookHistoryError extends Error {
   public readonly statusCode = 503;
 
+  constructor(message: string) {
+    super(message);
+    this.name = 'BlockbookHistoryError';
+  }
+}
+
+export class BlockbookHistoryLimitError extends BlockbookHistoryError {
   constructor() {
     super('Blockbook cannot return the full pending address history within its pagination limit');
     this.name = 'BlockbookHistoryLimitError';
   }
 }
+
+const historyChanged = () =>
+  new BlockbookHistoryError('Bitcoin address history changed during pagination; restart from the first page');
 
 function inputTxid(txid: string) {
   const hash = Hash.safeParse(txid.toLowerCase());
@@ -195,7 +205,13 @@ export class BlockbookClient implements Pick<IBitcoinDataProvider, 'getAddressTx
       const first = await this.readAddressPage(address, 1, CHAIN_PAGE_SIZE + MEMPOOL_PAGE_SIZE, signal);
       const pending = first.txids.slice(0, Math.min(first.unconfirmedTxs, MEMPOOL_PAGE_SIZE));
       if (pending.length !== Math.min(first.unconfirmedTxs, MEMPOOL_PAGE_SIZE)) {
-        throw new Error('Blockbook address history changed while reading the first page; retry');
+        throw historyChanged();
+      }
+      // The last returned txid is the public cursor. A confirmed cursor only
+      // continues in chain history, so don't issue one ahead of unseen pending rows.
+      if (pending.length < first.unconfirmedTxs) {
+        if (new Set(pending).size !== pending.length) throw historyChanged();
+        return { pending, confirmed: [] };
       }
       return { pending, confirmed: await this.getFirstConfirmedTxids(address, first, pending, signal) };
     }
@@ -301,7 +317,7 @@ export class BlockbookClient implements Pick<IBitcoinDataProvider, 'getAddressTx
       confirmed.length !== Math.min(first.txs, CHAIN_PAGE_SIZE) ||
       new Set([...pending, ...confirmed]).size !== pending.length + confirmed.length
     ) {
-      throw new Error('Blockbook address history changed while reading the first page; retry');
+      throw historyChanged();
     }
     return confirmed;
   }
@@ -319,7 +335,7 @@ export class BlockbookClient implements Pick<IBitcoinDataProvider, 'getAddressTx
       pageSize = MEMPOOL_SCAN_PAGE_SIZE;
       const expanded = await this.readAddressPage(address, 1, pageSize, signal);
       if (expanded.unconfirmedTxs !== first.unconfirmedTxs || prefix.some((txid, i) => txid !== expanded.txids[i])) {
-        throw new Error('Blockbook address history changed while reading a mempool cursor; retry');
+        throw historyChanged();
       }
       first = expanded;
     }
@@ -332,13 +348,21 @@ export class BlockbookClient implements Pick<IBitcoinDataProvider, 'getAddressTx
       count > pageSize &&
       first.txids.length === pageSize &&
       first.totalPages === Math.max(1, Math.ceil(first.txs / pageSize));
-    const available = hasTruncatedPrefix ? pageSize : Math.min(count, pageSize * MAX_MEMPOOL_SCAN_PAGES);
+    // The scan limit is for additional network requests, not an already complete
+    // pending prefix on the first page of an older Blockbook server.
+    const available =
+      first.txids.length >= count
+        ? count
+        : hasTruncatedPrefix
+          ? pageSize
+          : Math.min(count, pageSize * MAX_MEMPOOL_SCAN_PAGES);
     const pending: string[] = [];
     const seen = new Set<string>();
-    let found = false;
+    let cursorOffset = -1;
     for (let page = 1; (page - 1) * pageSize < available; page++) {
       const current = page === 1 ? first : await this.readAddressPage(address, page, pageSize, signal);
-      const remaining = available - (page - 1) * pageSize;
+      const offset = (page - 1) * pageSize;
+      const remaining = available - offset;
       const pagePending = current.txids.slice(0, remaining);
       // Legacy first pages can contain the entire pending prefix. Combined pages must contain
       // exactly their pending slots; a clamped page, changed count, or repetition means retry.
@@ -348,29 +372,31 @@ export class BlockbookClient implements Pick<IBitcoinDataProvider, 'getAddressTx
         pagePending.length < Math.min(remaining, pageSize) ||
         (page > 1 && current.txids.length > pageSize)
       ) {
-        throw new Error('Blockbook address history changed while reading a mempool cursor; retry');
+        throw historyChanged();
       }
-      for (const txid of pagePending) {
-        if (seen.has(txid)) {
-          throw new Error('Blockbook returned duplicate address history while reading a mempool cursor; retry');
-        }
+      for (const [index, txid] of pagePending.entries()) {
+        if (seen.has(txid)) throw historyChanged();
         seen.add(txid);
-        if (found) pending.push(txid);
-        if (txid === cursor) found = true;
+        if (cursorOffset !== -1) pending.push(txid);
+        if (txid === cursor) cursorOffset = offset + index;
         if (pending.length === MEMPOOL_PAGE_SIZE) break;
       }
       if (pending.length === MEMPOOL_PAGE_SIZE || pagePending.length === remaining) break;
     }
-    if (pending.length < MEMPOOL_PAGE_SIZE && available < count) {
-      throw new BlockbookHistoryLimitError();
-    }
-    if (!found) {
+    if (cursorOffset === -1) {
+      const status = await this.getTransactionStatus(cursor, signal);
+      // The cursor was pending at the start. If it moved to a block, continuing
+      // from that block would lose the pending rows that followed the old cursor.
+      if (status?.confirmed !== false) throw historyChanged();
+      if (available < count) throw new BlockbookHistoryLimitError();
       throw new BlockbookInputError('after_txid does not belong to this Bitcoin address history', 400);
     }
-    const confirmed = await this.getFirstConfirmedTxids(address, first, pending, signal);
-    if (confirmed.some((txid) => seen.has(txid))) {
-      throw new Error('Blockbook address history changed while reading a mempool cursor; retry');
+    if (cursorOffset + 1 + pending.length < count) {
+      if (pending.length < MEMPOOL_PAGE_SIZE) throw new BlockbookHistoryLimitError();
+      return { pending, confirmed: [] };
     }
+    const confirmed = await this.getFirstConfirmedTxids(address, first, pending, signal);
+    if (confirmed.some((txid) => seen.has(txid))) throw historyChanged();
     return { pending, confirmed };
   }
 
@@ -379,17 +405,15 @@ export class BlockbookClient implements Pick<IBitcoinDataProvider, 'getAddressTx
     hydrate: (txid: string) => Promise<Transaction>,
   ): Promise<Transaction[]> {
     const { pending, confirmed } = await this.getAddressTxids(request, AbortSignal.timeout(20_000));
-    const load = (txid: string, requireConfirmed: boolean) =>
+    const load = (txid: string, confirmed: boolean) =>
       this.hydrateLimit(async () => {
         const tx = await hydrate(txid);
-        if (tx.txid !== txid || (requireConfirmed && !tx.status.confirmed)) {
+        if (tx.txid !== txid) {
           throw new Error('Bitcoin history transaction did not match the selected transaction; retry');
         }
+        if (tx.status.confirmed !== confirmed) throw historyChanged();
         return tx;
       });
-    return Promise.all([
-      ...pending.map((txid) => load(txid, false)),
-      ...confirmed.map((txid) => load(txid, Boolean(request.after_txid))),
-    ]);
+    return Promise.all([...pending.map((txid) => load(txid, false)), ...confirmed.map((txid) => load(txid, true))]);
   }
 }
