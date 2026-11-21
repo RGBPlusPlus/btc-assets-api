@@ -18,6 +18,8 @@ const ready = { blockbook: { inSync: true, inSyncMempool: true, bestHeight: 100 
 const auth = 'Bearer unit-test-only';
 const origin = 'https://example.test';
 let oracleCorrupt = false;
+let oracleStatus = ready;
+let indexedTipReads = 0;
 let wrongIndexedTip = false;
 let strictMinimum = false;
 let omitMempool = false;
@@ -45,26 +47,33 @@ const server = createServer((req, res) => {
       response = { blockHash: genesis };
       break;
     case '/oracle/api/v2/block-index/100':
+      indexedTipReads++;
+      if (oracleStatus.blockbook.bestHeight < info.blocks) {
+        res.writeHead(404).end();
+        return;
+      }
       response = { blockHash: wrongIndexedTip ? 'e'.repeat(64) : hash };
       break;
     case '/oracle/api/':
-      response = ready;
+      response = oracleStatus;
       break;
     case '/api/rgbpp/v1/address/' + address + '/assets':
       assert.equal(url.searchParams.get('no_cache'), 'true');
       response = [{ outPoint: { txHash: ckb, index: '0x0001' } }];
       break;
-    case '/api/bitcoin/v1/address/' + address + '/unspent':
+    case '/api/bitcoin/v1/address/' + address + '/unspent': {
       assert.equal(url.searchParams.get('no_cache'), 'true');
+      const confirmedOnly = (url.searchParams.get('only_confirmed') ?? 'true') === 'true';
       response = data.filter(
         (row) =>
           (!omitMempool || row.status.confirmed) &&
-          (url.searchParams.get('only_confirmed') !== 'true' || row.status.confirmed) &&
+          (!confirmedOnly || row.status.confirmed) &&
           (strictMinimum
             ? row.value > Number(url.searchParams.get('min_satoshi') ?? '0')
             : row.value >= Number(url.searchParams.get('min_satoshi') ?? '0')),
       );
       break;
+    }
     case '/oracle/api/v2/utxo/' + address:
       assert.equal(url.searchParams.get('confirmed'), 'false');
       response = data.map(({ txid, vout, value, status }, i) => ({
@@ -97,8 +106,10 @@ const env = {
   E2E_RGBPP_OUTPOINT: ckb + ':0x01',
 };
 async function run(overrides) {
-  const child = spawn(process.execPath, ['--test', fileURLToPath(new URL('./asset-api-e2e.mjs', import.meta.url))], {
-    env: { ...env, ...overrides },
+  const suite = fileURLToPath(new URL('./asset-api-e2e.mjs', import.meta.url));
+  const child = spawn(process.execPath, ['--test', '--test-reporter=tap', suite], {
+    // The fixture checks TAP diagnostics. Do not let ambient Node flags select another reporter.
+    env: { ...env, ...overrides, NODE_OPTIONS: '' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -109,9 +120,15 @@ async function run(overrides) {
   return { code, output };
 }
 try {
+  const defaultConfirmed = await fetch(`${root}/api/bitcoin/v1/address/${address}/unspent?no_cache=true`, {
+    headers: { Authorization: auth, Origin: origin },
+    signal: AbortSignal.timeout(20_000),
+  });
+  assert.equal(defaultConfirmed.status, 200);
+  assert.deepEqual(await defaultConfirmed.json(), data.filter((row) => row.status.confirmed));
   const all = await run({});
   assert.equal(all.code, 0, all.output);
-  assert.match(all.output, /pass 5/);
+  assert.match(all.output, /^# pass 5$/m);
   console.log(all.output);
   const bareOptions = {
     E2E_BLOCKBOOK_URL: '',
@@ -121,8 +138,8 @@ try {
   };
   const bare = await run(bareOptions);
   assert.equal(bare.code, 0, bare.output);
-  assert.match(bare.output, /pass 2/);
-  assert.match(bare.output, /skip(?:ped)? 3/);
+  assert.match(bare.output, /^# pass 2$/m);
+  assert.match(bare.output, /^# skipped 3$/m);
   const badFixture = await run({ E2E_BTC_VALUE_SATS: '1001' });
   assert.equal(badFixture.code, 1);
   assert.match(badFixture.output, /known fixture UTXO is incorrect or missing/);
@@ -145,6 +162,18 @@ try {
   const missing = await run({ E2E_BTC_OUTPOINT: '' });
   assert.equal(missing.code, 1);
   assert.match(missing.output, /Set E2E_BTC_OUTPOINT before running/);
+  for (const [inSync, message] of [
+    [false, /Blockbook is not synced/],
+    [true, /Blockbook and Asset API heights differ/],
+  ]) {
+    oracleStatus = { ...ready, blockbook: { ...ready.blockbook, inSync, bestHeight: info.blocks - 1 } };
+    const before = indexedTipReads;
+    const laggingOracle = await run({});
+    assert.equal(laggingOracle.code, 1);
+    assert.match(laggingOracle.output, message);
+    assert.equal(indexedTipReads, before, 'must not query an unindexed height');
+  }
+  oracleStatus = ready;
   wrongIndexedTip = true;
   const badTip = await run({});
   assert.equal(badTip.code, 1);

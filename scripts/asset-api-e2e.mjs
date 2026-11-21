@@ -150,6 +150,18 @@ function assertEqual(left, right, label) {
   assert.equal(right.size, left.size, `${label}: result contains extra outpoints`);
 }
 
+function blockbookStatusMismatch(status, tip) {
+  if (status?.blockbook?.inSync !== true || status.blockbook.inSyncMempool !== true) {
+    return 'Blockbook is not synced';
+  }
+  if (status.blockbook.bestHeight !== tip.blocks) {
+    return 'Blockbook and Asset API heights differ; retry after sync';
+  }
+  if (status.backend?.bestBlockHash !== tip.bestblockhash) {
+    return 'Blockbook and Asset API tips differ; retry after sync';
+  }
+}
+
 async function stableView(check) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const tip = await info();
@@ -226,28 +238,20 @@ test('Address UTXOs match the optional Blockbook oracle', { skip: !oracle && 'se
   const genesis = await get(oracle, '/api/v2/block-index/0', 'Blockbook genesis');
   assert.equal(genesis.blockHash, GENESIS[network], 'Blockbook is on a different Bitcoin network');
   await stableView(async (all, tip) => {
-    const before = await get(oracle, '/api/', 'Blockbook status');
+    const statusMismatch = async () => blockbookStatusMismatch(await get(oracle, '/api/', 'Blockbook status'), tip);
     const indexedHash = () => get(oracle, `/api/v2/block-index/${tip.blocks}`, 'Blockbook indexed tip');
+    // A lagging index may not serve the requested height. Report the status mismatch
+    // without that lookup, but still let stableView retry if the Asset API view moved.
+    const beforeMismatch = await statusMismatch();
+    if (beforeMismatch) return () => assert.fail(beforeMismatch);
     const beforeIndexed = await indexedHash();
     const read = () => get(oracle, `/api/v2/utxo/${address}?confirmed=false`, 'Blockbook address UTXOs');
     const expected = normalize(await read(), 'Blockbook', true);
     const repeated = normalize(await read(), 'Blockbook', true);
+    const afterMismatch = await statusMismatch();
+    if (afterMismatch) return () => assert.fail(afterMismatch);
     const afterIndexed = await indexedHash();
-    const after = await get(oracle, '/api/', 'Blockbook status');
     return () => {
-      for (const status of [before, after]) {
-        assert(status.blockbook?.inSync && status.blockbook?.inSyncMempool, 'Blockbook is not synced');
-        assert.equal(
-          status.blockbook.bestHeight,
-          tip.blocks,
-          'Blockbook and Asset API heights differ; retry after sync',
-        );
-        assert.equal(
-          status.backend?.bestBlockHash,
-          tip.bestblockhash,
-          'Blockbook and Asset API tips differ; retry after sync',
-        );
-      }
       for (const indexed of [beforeIndexed, afterIndexed]) {
         assert.equal(indexed.blockHash, tip.bestblockhash, 'Blockbook indexed block differs from the Asset API tip');
       }
