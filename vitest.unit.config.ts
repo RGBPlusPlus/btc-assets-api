@@ -6,6 +6,7 @@ export default defineConfig({
     // The default Vitest config still runs those suites when backends are configured.
     include: [
       'test/utils/**/*.test.ts',
+      'test/plugins/public-api-auth.test.ts',
       'test/routes/rgbpp/activity-cursor.test.ts',
       'test/routes/rgbpp/pending-output-cells.test.ts',
       'test/services/bitcoin.test.ts',

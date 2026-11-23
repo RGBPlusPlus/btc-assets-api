@@ -6,6 +6,7 @@ import bitcoinRoutes from './routes/bitcoin';
 import tokenRoutes from './routes/token';
 import swagger from './plugins/swagger';
 import jwt from './plugins/jwt';
+import { markPublicApiRoute } from './plugins/public-api-auth';
 import cache from './plugins/cache';
 import rateLimit from './plugins/rate-limit';
 import { getSafeEnvs } from './env';
@@ -45,9 +46,12 @@ async function routes(fastify: FastifyInstance) {
 
   fastify.register(internalRoutes, { prefix: '/internal' });
   fastify.register(tokenRoutes, { prefix: '/token' });
-  fastify.register(bitcoinRoutes, { prefix: '/bitcoin/v1' });
-  fastify.register(rgbppRoutes, { prefix: '/rgbpp/v1' });
-  fastify.register(rgbppRoutesV2, { prefix: '/rgbpp/v2' });
+  fastify.register(async function publicApiRoutes(scope) {
+    scope.addHook('onRoute', markPublicApiRoute);
+    scope.register(bitcoinRoutes, { prefix: '/bitcoin/v1' });
+    scope.register(rgbppRoutes, { prefix: '/rgbpp/v1' });
+    scope.register(rgbppRoutesV2, { prefix: '/rgbpp/v2' });
+  });
 
   // register cron routes only on Vercel
   if (provider === 'vercel' || env.NODE_ENV === 'test') {

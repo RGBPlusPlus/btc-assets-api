@@ -5,6 +5,7 @@ import { jsonSchemaTransform } from 'fastify-type-provider-zod';
 import { env } from '../env';
 import { SWAGGER_PROD_IGNORE_URLS } from '../constants';
 import pkg from '../../package.json';
+import { isUnauthenticatedPublicApi } from './public-api-auth';
 
 export const DOCS_ROUTE_PREFIX = '/docs';
 
@@ -37,7 +38,13 @@ export default fp(async (fastify) => {
       },
       ...securityConfig,
     },
-    transform: jsonSchemaTransform,
+    transform: (input) => {
+      const result = jsonSchemaTransform(input);
+      if (!isUnauthenticatedPublicApi(input.route.config)) {
+        return result;
+      }
+      return { ...result, schema: { ...result.schema, security: [] } };
+    },
     transformObject: ({ openapiObject }) => {
       if (env.NODE_ENV === 'production') {
         const { paths = {} } = openapiObject;
