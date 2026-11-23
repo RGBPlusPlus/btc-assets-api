@@ -1,17 +1,10 @@
 import Fastify, { type FastifyInstance } from 'fastify';
-import * as Sentry from '@sentry/node';
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, expect, test } from 'vitest';
 import { env } from '../../src/env';
 import cors from '../../src/plugins/cors';
 import jwt from '../../src/plugins/jwt';
 import { markPublicApiRoute } from '../../src/plugins/public-api-auth';
 import swagger from '../../src/plugins/swagger';
-
-vi.mock('@sentry/node', async (importOriginal) => ({
-  ...(await importOriginal<typeof Sentry>()),
-  setTag: vi.fn(),
-  setTags: vi.fn(),
-}));
 
 const origin = 'https://client.example';
 const originalJwtRequired = env.PUBLIC_API_JWT_REQUIRED;
@@ -24,7 +17,11 @@ async function buildFixture(jwtRequired?: boolean) {
   if (jwtRequired !== undefined) env.PUBLIC_API_JWT_REQUIRED = jwtRequired;
   const server = Fastify({ logger: false });
   app = server;
-  server.decorate('Sentry', Sentry);
+  const sentryStub: Pick<FastifyInstance['Sentry'], 'setTag' | 'setTags'> = {
+    setTag: () => {},
+    setTags: () => {},
+  };
+  server.decorate('Sentry', sentryStub as FastifyInstance['Sentry']);
   await server.register(cors);
   await server.register(jwt);
   await server.register(swagger);
