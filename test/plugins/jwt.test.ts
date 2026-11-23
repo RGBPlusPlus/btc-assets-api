@@ -5,7 +5,7 @@ import { JwtPayload } from '../../src/plugins/jwt';
 
 describe('JWT Plugin', () => {
   let token: string;
-  let decodedToken: JwtPayload;
+  let decodedToken: Required<JwtPayload>;
 
   beforeAll(async () => {
     const fastify = buildFastify();

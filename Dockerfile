@@ -6,9 +6,10 @@ COPY . .
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
+# Corepack uses the exact packageManager version in package.json.
 RUN corepack enable pnpm
 
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 pnpm install --frozen-lockfile
 RUN pnpm run build
 
 EXPOSE 3000
