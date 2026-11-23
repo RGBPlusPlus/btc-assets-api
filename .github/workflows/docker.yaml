@@ -10,12 +10,14 @@ on:
       - release/*
 
 jobs:
-  docker-build-push:
-    runs-on: ubuntu-22.04
+  metadata:
+    runs-on: ubuntu-24.04
     permissions:
-      packages: write
       contents: read
-
+    outputs:
+      json: ${{ steps.meta.outputs.json }}
+      labels: ${{ steps.meta.outputs.labels }}
+      annotations: ${{ steps.meta.outputs.annotations }}
     steps:
       - uses: actions/checkout@v4
 
@@ -36,6 +38,36 @@ jobs:
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
 
+  build:
+    needs: metadata
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare image metadata
+        id: image
+        shell: bash
+        env:
+          ANNOTATIONS: ${{ needs.metadata.outputs.annotations }}
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          # Attach annotations to the platform manifest, not to an index.
+          {
+            echo 'annotations<<EOF'
+            printf '%s\n' "$ANNOTATIONS" | sed -n '/^manifest:/p'
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -46,13 +78,85 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Docker image
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
           provenance: false
-          platforms: linux/amd64, linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ needs.metadata.outputs.labels }}
+          annotations: ${{ steps.image.outputs.annotations }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push=true,push-by-digest=true,name-canonical=true,oci-mediatypes=true
+
+      - name: Save digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s\n' "$DIGEST" > "${RUNNER_TEMP}/digest"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: ${{ runner.temp }}/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the multi-platform index
+        shell: bash
+        env:
+          METADATA: ${{ needs.metadata.outputs.json }}
+          ANNOTATIONS: ${{ needs.metadata.outputs.annotations }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          sources=()
+          for arch in amd64 arm64; do
+            digest=$(cat "${RUNNER_TEMP}/digests/digest-${arch}/digest")
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            source="$image@$digest"
+            metadata=$(docker buildx imagetools inspect \
+              --format '{"manifest":{{json .Manifest}},"image":{{json .Image}}}' "$source")
+            jq -e --arg arch "$arch" '
+              .manifest.mediaType == "application/vnd.oci.image.manifest.v1+json" and
+              .image.os == "linux" and .image.architecture == $arch
+            ' <<< "$metadata" > /dev/null
+            sources+=("$source")
+          done
+          [[ "${sources[0]}" != "${sources[1]}" ]]
+
+          tags=$(jq -er '.tags | select(length > 0) | .[]' <<< "$METADATA")
+          args=()
+          while IFS= read -r tag; do
+            args+=(--tag "$tag")
+          done <<< "$tags"
+          # The manifest annotations are already embedded in the two source images.
+          while IFS= read -r annotation; do
+            if [[ "$annotation" == index:* ]]; then
+              args+=(--annotation "$annotation")
+            fi
+          done <<< "$ANNOTATIONS"
+          docker buildx imagetools create "${args[@]}" "${sources[@]}"
+
