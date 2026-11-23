@@ -1,6 +1,7 @@
 {
   "name": "btc-assets-api",
   "version": "2.5.12",
+  "packageManager": "pnpm@12.21.0",
   "title": "Bitcoin/RGB++ Assets API",
   "description": "",
   "main": "index.js",
