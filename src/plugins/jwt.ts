@@ -4,6 +4,7 @@ import { env } from '../env';
 import jwt from '@fastify/jwt';
 import { JWT_IGNORE_URLS } from '../constants';
 import { HttpStatusCode } from 'axios';
+import { isUnauthenticatedPublicApi } from './public-api-auth';
 
 export interface JwtPayload {
   sub: string;
@@ -44,7 +45,8 @@ export default fp(async (fastify) => {
     // Production environment: enable JWT verification
     if (
       request.method.toLowerCase() === 'options' ||
-      JWT_IGNORE_URLS.some((prefix) => request.url.startsWith(prefix))
+      JWT_IGNORE_URLS.some((prefix) => request.url.startsWith(prefix)) ||
+      isUnauthenticatedPublicApi(request.routeOptions.config)
     ) {
       return;
     }

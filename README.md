@@ -90,6 +90,8 @@ ADMIN_PASSWORD=<admin_password>
 
 # JWT_SECRET is used to sign the JWT token for authentication
 JWT_SECRET=<your_secret>
+# Set to false only if public Bitcoin and RGB++ read and write routes may be anonymous.
+PUBLIC_API_JWT_REQUIRED=true
 # JWT token denylist
 # JWT_DENYLIST=
 
@@ -159,6 +161,18 @@ Address history accepts both confirmed and pending transaction cursors. Each pag
 Blockbook releases that cap pending txids to a single REST page, such as v0.6.0, cannot enumerate beyond 1,000 pending entries. A continuation that needs the hidden entries returns HTTP 503 instead of silently skipping them.
 
 To override only UTXOs and keep the rest on Electrs or Mempool, keep the existing `BITCOIN_DATA_PROVIDER` and set only `BITCOIN_BLOCKBOOK_API_URL`. In both modes, a live UTXO query returns the entire list including mempool changes; it is not paginated and omits optional `block_hash` and `block_time`. Sync jobs refresh directly from Blockbook rather than address history; sync jobs and snapshots are separate from the legacy backend and other Blockbook endpoints. Use `no_cache=true` to test a live read.
+
+Public Bitcoin and RGB++ routes require JWTs by default (except in development).
+Setting `PUBLIC_API_JWT_REQUIRED=false` makes the registered `/bitcoin/v1`,
+`/rgbpp/v1`, and `/rgbpp/v2` operations anonymous, including transaction
+broadcast and submission. These operations ignore any supplied Authorization
+header and allow cross-origin browser access. Other routes keep their existing
+authorization; keep setting `JWT_SECRET` for token signing.
+
+For a restricted deployment, enforce its access policy at the gateway or on a
+private network. If the deployment should only serve reads, explicitly allowlist
+the read operations at the gateway. Keep IP rate limits in place and monitor
+transaction queues and paymaster usage.
 
 #### Docker
 

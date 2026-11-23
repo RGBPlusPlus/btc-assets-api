@@ -3,6 +3,7 @@ import cors, { FastifyCorsOptions } from '@fastify/cors';
 import fp from 'fastify-plugin';
 import { JWT_IGNORE_URLS } from '../constants';
 import { env } from '../env';
+import { isUnauthenticatedPublicApi } from './public-api-auth';
 
 export default fp(async (fastify) => {
   await fastify.register(cors, () => {
@@ -15,7 +16,8 @@ export default fp(async (fastify) => {
 
       if (
         request.method.toLowerCase() === 'options' ||
-        JWT_IGNORE_URLS.some((prefix) => request.url.startsWith(prefix))
+        JWT_IGNORE_URLS.some((prefix) => request.url.startsWith(prefix)) ||
+        isUnauthenticatedPublicApi(request.routeOptions.config)
       ) {
         corsOptions.origin = true;
         return corsOptions;

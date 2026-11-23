@@ -87,6 +87,13 @@ const envSchema = z
      */
     JWT_SECRET: z.string(),
     /**
+     * Require JWTs on the public Bitcoin and RGB++ API routes.
+     */
+    PUBLIC_API_JWT_REQUIRED: z
+      .enum(['true', 'false'])
+      .default('true')
+      .transform((value) => value === 'true'),
+    /**
      * JWT_DENYLIST is used to store the denylisted JWT tokens.
      * support multiple tokens separated by comma, use token or jti to denylist.
      */
