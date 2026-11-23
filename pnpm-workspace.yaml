@@ -1,0 +1,6 @@
+# Allow native/runtime setup and esbuild's platform binary setup only.
+allowBuilds:
+  '@sentry/profiling-node': true
+  esbuild: true
+  msgpackr-extract: true
+  simple-git-hooks: false

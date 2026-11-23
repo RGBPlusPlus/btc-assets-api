@@ -6,9 +6,10 @@ COPY . .
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable pnpm
+# Pin pnpm so the dependency build policy does not drift with Corepack defaults.
+RUN corepack enable pnpm && corepack install --global pnpm@11.25.0
 
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store SKIP_INSTALL_SIMPLE_GIT_HOOKS=1 pnpm install --frozen-lockfile
 RUN pnpm run build
 
 EXPOSE 3000
