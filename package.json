@@ -10,6 +10,7 @@
     "start": "node ./dist/src/index.js",
     "build": "tsc -p tsconfig.json",
     "test": "vitest",
+    "test:unit": "vitest run --config vitest.unit.config.ts",
     "test:e2e": "node --test scripts/asset-api-e2e.mjs",
     "test:e2e:fixture": "node scripts/check-asset-api-e2e.mjs",
     "format": "eslint --fix --ext .ts && prettier --write '**/*.ts'",

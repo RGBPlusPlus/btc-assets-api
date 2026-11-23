@@ -170,6 +170,12 @@ docker-compose up
 
 After the service is running, you can access the API documentation at `http://localhost:3000/docs`
 
+## Tests
+
+Run `pnpm test:unit` for the offline unit and mock suites used by CI. No services or secrets are required.
+The full Vitest suite (`pnpm test`) also includes integration tests that need Redis and configured backends.
+Use a disposable Redis instance: test teardown flushes it.
+
 ## End-to-end tests
 
 Run these read-only HTTP checks against a **running Asset API** using any supported Bitcoin backend. They do not start the server, broadcast transactions, flush Redis, or run as part of the default unit tests. The API can still perform its normal cache and queue updates during these reads.

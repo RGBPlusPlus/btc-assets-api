@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment */
-import container from '../../src/container';
+import type { Cradle } from '../../src/container';
+import { NetworkType } from '../../src/constants';
 import { describe, test, beforeEach, afterEach, vi, expect } from 'vitest';
 import Unlocker from '../../src/services/unlocker';
 import { Cell } from '@ckb-lumos/lumos';
@@ -17,9 +18,11 @@ describe('Unlocker', () => {
   let unlocker: Unlocker;
 
   beforeEach(async () => {
-    const cradle = container.cradle;
-    // TODO: mock env.TRANSACTION_SPV_SERVICE_URL
-    unlocker = new Unlocker(cradle);
+    unlocker = new Unlocker({
+      env: { NETWORK: NetworkType.testnet, UNLOCKER_CELL_BATCH_SIZE: 100 },
+      ckb: { indexer: { collector: () => ({ collect: vi.fn() }) } },
+      bitcoin: { getBlockchainInfo: vi.fn(), getTx: vi.fn() },
+    } as unknown as Cradle);
   });
 
   afterEach(() => {
