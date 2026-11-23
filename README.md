@@ -93,7 +93,7 @@ JWT_SECRET=<your_secret>
 # JWT token denylist
 # JWT_DENYLIST=
 
-# Bitcoin data provider, support mempool and electrs
+# Bitcoin data provider: electrs, mempool, or blockbook (requires Bitcoin Core RPC)
 # use electrs as default, mempool as fallback
 # change to mempool if you want to use mempool.space as default and electrs as fallback
 BITCOIN_DATA_PROVIDER=electrs
@@ -103,6 +103,8 @@ BITCOIN_MEMPOOL_SPACE_API_URL=https://mempool.space
 # Electrs API URL
 # optinal when BITCOIN_DATA_PROVIDER=mempool
 BITCOIN_ELECTRS_API_URL=<http://electrs:3002>
+# Optional: use a synced Blockbook instance only for Bitcoin address UTXOs
+# BITCOIN_BLOCKBOOK_API_URL=http://blockbook:19130
 
 # SPV Service URL
 BITCOIN_SPV_SERVICE_URL=<http://spv:3001>
@@ -135,7 +137,28 @@ TRANSACTION_QUEUE_JOB_ATTEMPTS=6
 TRANSACTION_PAY_FOR_MIN_FEE_RATE_REJECT=false
 ```
 
-More configuration options can be found in the `src/env.ts` file.
+### Self-host with Blockbook and Bitcoin Core
+
+Use `blockbook` to run without Electrs or Mempool.space. Example for Bitcoin Testnet3:
+
+```dotenv
+NETWORK=testnet
+BITCOIN_DATA_PROVIDER=blockbook
+BITCOIN_BLOCKBOOK_API_URL=http://blockbook:19130
+BITCOIN_CORE_RPC_URL=http://bitcoind:18332
+BITCOIN_CORE_RPC_USERNAME=<rpc_user>
+BITCOIN_CORE_RPC_PASSWORD=<rpc_password>
+```
+
+Adjust the ports to match your deployment. Use the Blockbook service base URL without `/api/v2`. Use synced Bitcoin Core 31+ with `txindex=1`, `txospenderindex=1`, and `prune=0`, and a fully indexed Blockbook with mempool indexing. Point Blockbook and the Asset API to the same Core when possible. The API checks that both services are on the configured network at startup. Keep RPC private; set both credentials, or omit both only when a private proxy authenticates upstream. `/healthcheck` probes Core's chain and both indexes and Blockbook's chain and mempool sync.
+
+Blockbook serves address UTXOs and indexes address history. Core supplies transaction details, fees, canonical block and header data for SPV, exact confirmed and mempool spends, and broadcast. Core needs the additional spender index for exact spending outpoints, not a separate Bitcoin node. This mode does not use legacy Bitcoin providers or additional Electrs broadcast targets. The separate `BITCOIN_SPV_SERVICE_URL`, Redis, and CKB requirements are unchanged.
+
+Address history accepts both confirmed and pending transaction cursors. Each page returns up to 50 pending transactions first. Once the pending rows are exhausted, that same page can include up to 25 confirmed transactions. If the API detects a change to pending history while assembling a page, it can return HTTP 503 with instructions to restart from the first page. A change detected while reading confirmed history can instead return a generic HTTP 503. A txid cursor does not record its previous confirmation state, so also restart if a pending cursor confirms between page requests and you need to include any still-pending rows.
+
+Blockbook releases that cap pending txids to a single REST page, such as v0.6.0, cannot enumerate beyond 1,000 pending entries. A continuation that needs the hidden entries returns HTTP 503 instead of silently skipping them.
+
+To override only UTXOs and keep the rest on Electrs or Mempool, keep the existing `BITCOIN_DATA_PROVIDER` and set only `BITCOIN_BLOCKBOOK_API_URL`. In both modes, a live UTXO query returns the entire list including mempool changes; it is not paginated and omits optional `block_hash` and `block_time`. Sync jobs refresh directly from Blockbook rather than address history; sync jobs and snapshots are separate from the legacy backend and other Blockbook endpoints. Use `no_cache=true` to test a live read.
 
 #### Docker
 
@@ -146,3 +169,30 @@ docker-compose up
 ```
 
 After the service is running, you can access the API documentation at `http://localhost:3000/docs`
+
+## End-to-end tests
+
+Run these read-only HTTP checks against a **running Asset API** using any supported Bitcoin backend. They do not start the server, broadcast transactions, flush Redis, or run as part of the default unit tests. The API can still perform its normal cache and queue updates during these reads.
+
+Use Node.js 20 or newer and a quiet address with a known confirmed, currently unspent output. Verify the fixture outpoint and amount independently (for example, with Bitcoin Core's `gettxout` for that outpoint); do not copy them from the API under test.
+
+```sh
+export E2E_ASSET_API_URL=http://localhost:3000
+export E2E_BTC_NETWORK=testnet # mainnet, testnet (Testnet3), or signet
+export E2E_BTC_ADDRESS='<BTC address>'
+export E2E_BTC_OUTPOINT='<txid>:<decimal vout>'
+export E2E_BTC_VALUE_SATS='<amount in satoshis>'
+pnpm test:e2e
+```
+
+The suite checks service health, the Bitcoin genesis and tip response, the confirmed fixture UTXO, and inclusive/exclusive value filtering. It bypasses the address UTXO cache and checks that the Bitcoin tip and the address's UTXOs are stable across the filter requests.
+
+Optional checks and configuration:
+
+- For an authenticated API, supply `E2E_ASSET_API_JWT` securely in your local environment and set `E2E_ASSET_API_ORIGIN` to the origin matching the JWT audience. Bearer authentication requires HTTPS or literal loopback (`127.0.0.1` or `::1`); redirects are not followed.
+- Set `E2E_BTC_UNCONFIRMED_OUTPOINT=<txid>:<decimal vout>` to verify that a separately known mempool output at the same address is returned only without the confirmation filter. Otherwise this check is skipped.
+- Set `E2E_BTC_MIN_UTXOS=501` and use a fixture known to have at least 501 current UTXOs to detect truncation. Use an ordinary fixture on backends that enforce an address limit.
+- Set `E2E_BLOCKBOOK_URL` to the base URL of a synced Blockbook instance on the same chain to compare the exact outpoints, satoshi values, and confirmed/mempool status. The oracle's indexed tip must match the Asset API, and the fixture should not be changing in the mempool. If the API uses this same Blockbook instance, the comparison verifies mapping, not correctness of the index itself.
+- For an RGB++ fixture, set `E2E_RGBPP_OUTPOINT=0x<CKB tx hash>:0x<index>` to check that the corresponding live cell is returned from the address assets endpoint. Use a small fixture here to avoid expensive CKB lookups.
+
+Use `pnpm test:e2e:fixture` to exercise the runner against a disposable loopback fixture without a running Asset API.
