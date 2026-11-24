@@ -301,53 +301,55 @@ export default class CKBClient {
     }
 
     const scripts = this.getScripts();
-    let batchRequest = this.rpc.createBatchRequest();
-
-    // info cell script could be unique cell or inscription cell
-    [scripts.UNIQUE, scripts.INSCRIPTION].forEach((script) => {
-      const searchScript = { ...script, args: '0x' };
-      batchRequest.add(
-        'getTransactions',
-        {
-          script: searchScript,
-          scriptType: 'type',
-        },
-        // XXX: The returned result is not asc-ordered, maybe it is a bug in ckb-indexer
-        'asc',
-        // TODO: There may be a maximum request limit.
-        '0xffff', // 0xffff basically means no limit
-      );
-    });
-    type getTransactionsResult = ReturnType<typeof this.rpc.getTransactions<false>>;
-    const infoCellTxs: Awaited<getTransactionsResult>[] = await batchRequest.exec();
-    const allIndexerTxs = infoCellTxs.reduce(
-      (acc, txs) => acc.concat(txs.objects.filter(({ ioType }: UngroupedIndexerTransaction) => ioType === 'output')),
-      [] as UngroupedIndexerTransaction[],
-    );
-
-    // get all transactions that have the xudt type cell and info cell
-    batchRequest = this.rpc.createBatchRequest();
-    allIndexerTxs
-      .sort((txA: UngroupedIndexerTransaction, txB: UngroupedIndexerTransaction) => {
-        // make sure `infoCellTxs` are asc-ordered
-        // related issue: https://github.com/nervosnetwork/ckb/issues/4549
-        const aBlockNumber = BI.from(txA.blockNumber).toNumber();
-        const bBlockNumber = BI.from(txB.blockNumber).toNumber();
-        if (aBlockNumber < bBlockNumber) return -1;
-        else if (aBlockNumber > bBlockNumber) return 1;
-        else if (aBlockNumber === bBlockNumber) {
-          const aTxIndex = BI.from(txA.txIndex).toNumber();
-          const bTxIndex = BI.from(txB.txIndex).toNumber();
-          if (aTxIndex < bTxIndex) return -1;
-          else if (aTxIndex > bTxIndex) return 1;
+    // The CKB indexer bounds page size. The Lumos batch API discards per-call
+    // JSON-RPC errors, so use individual requests for paginated searches.
+    const allIndexerTxs: UngroupedIndexerTransaction[] = [];
+    for (const script of [scripts.UNIQUE, scripts.INSCRIPTION]) {
+      const searchKey = { script: { ...script, args: '0x' }, scriptType: 'type' as const };
+      let cursor: string | undefined;
+      const seenCursors = new Set<string>();
+      for (;;) {
+        const page = await this.rpc.getTransactions(searchKey, 'asc', '0x3e8', cursor);
+        if (!page || !Array.isArray(page.objects)) {
+          throw new Error('CKB indexer returned an invalid metadata transaction page');
         }
-        // unreachable: aBlockNumber === bBlockNumber && aTxIndex === bTxIndex
-        return 0;
-      })
-      .forEach((tx: UngroupedIndexerTransaction) => {
-        batchRequest.add('getTransaction', tx.txHash);
-      });
-    const txs: TransactionWithStatus[] = await batchRequest.exec();
+        if (page.objects.length === 0) break;
+        for (const tx of page.objects) {
+          if (tx.ioType === 'output') allIndexerTxs.push(tx);
+        }
+        if (!page.lastCursor || seenCursors.has(page.lastCursor)) {
+          throw new Error('CKB indexer metadata transaction cursor did not advance');
+        }
+        seenCursors.add(page.lastCursor);
+        cursor = page.lastCursor;
+      }
+    }
+
+    // Preserve the earliest match across both scripts, including when the
+    // indexer returns transactions out of order within a block.
+    const txHashes = uniq(
+      allIndexerTxs
+        .sort(
+          (a, b) =>
+            BI.from(a.blockNumber).toNumber() - BI.from(b.blockNumber).toNumber() ||
+            BI.from(a.txIndex).toNumber() - BI.from(b.txIndex).toNumber(),
+        )
+        .map(({ txHash }) => txHash),
+    );
+    const txs: TransactionWithStatus[] = [];
+    for (let offset = 0; offset < txHashes.length; offset += 100) {
+      const hashes = txHashes.slice(offset, offset + 100);
+      const batch = this.rpc.createBatchRequest(hashes.map((hash) => ['getTransaction', hash]));
+      const results: TransactionWithStatus[] = await batch.exec();
+      if (
+        !Array.isArray(results) ||
+        results.length !== hashes.length ||
+        hashes.some((hash, i) => results[i]?.transaction?.hash !== hash)
+      ) {
+        throw new Error('CKB RPC returned an incomplete metadata transaction batch');
+      }
+      txs.push(...results);
+    }
     await this.dataCache.set('all', txs);
     return txs;
   }

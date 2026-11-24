@@ -11,6 +11,7 @@ export default defineConfig({
       'test/routes/rgbpp/activity-cursor.test.ts',
       'test/routes/rgbpp/pending-output-cells.test.ts',
       'test/services/bitcoin.test.ts',
+      'test/services/ckb-metadata.test.ts',
       'test/services/blockbook-config.test.ts',
       'test/services/blockbook-history.test.ts',
       'test/services/blockbook-provider.test.ts',
