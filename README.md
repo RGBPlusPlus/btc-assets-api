@@ -83,10 +83,10 @@ RATE_LIMIT_PER_MINUTE=100
 # The blocklist of IP addresses that are denied access to the API.
 # IP_BLOCKLIST=
 
-# Required in production mode
+# Set both to enable authenticated internal administration.
 # In mainnet env, only the administrator could generate access tokens.
-ADMIN_USERNAME=<admin_username>
-ADMIN_PASSWORD=<admin_password>
+# ADMIN_USERNAME=<admin_username>
+# ADMIN_PASSWORD=<admin_password>
 
 # JWT_SECRET is used to sign the JWT token for authentication
 JWT_SECRET=<your_secret>
@@ -166,8 +166,13 @@ Public Bitcoin and RGB++ routes require JWTs by default (except in development).
 Setting `PUBLIC_API_JWT_REQUIRED=false` makes the registered `/bitcoin/v1`,
 `/rgbpp/v1`, and `/rgbpp/v2` operations anonymous, including transaction
 broadcast and submission. These operations ignore any supplied Authorization
-header and allow cross-origin browser access. Other routes keep their existing
-authorization; keep setting `JWT_SECRET` for token signing.
+header and allow cross-origin browser access. Keep setting `JWT_SECRET` for token signing.
+
+Internal administrative routes are disabled unless both `ADMIN_USERNAME` and
+`ADMIN_PASSWORD` are configured. When enabled, they require HTTP Basic
+authentication in every environment, independently of public JWT settings.
+Keep these routes on a private network or restrict them at the gateway, and only
+send admin credentials over HTTPS (or local loopback).
 
 For a restricted deployment, enforce its access policy at the gateway or on a
 private network. If the deployment should only serve reads, explicitly allowlist
