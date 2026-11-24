@@ -83,8 +83,8 @@ RATE_LIMIT_PER_MINUTE=100
 # The blocklist of IP addresses that are denied access to the API.
 # IP_BLOCKLIST=
 
-# Set both to enable authenticated internal administration.
-# In mainnet env, only the administrator could generate access tokens.
+# Production: set both administrator credentials before exposing the service.
+# These are commented placeholders, not defaults.
 # ADMIN_USERNAME=<admin_username>
 # ADMIN_PASSWORD=<admin_password>
 
@@ -168,11 +168,20 @@ Setting `PUBLIC_API_JWT_REQUIRED=false` makes the registered `/bitcoin/v1`,
 broadcast and submission. These operations ignore any supplied Authorization
 header and allow cross-origin browser access. Keep setting `JWT_SECRET` for token signing.
 
-Internal administrative routes are disabled unless both `ADMIN_USERNAME` and
+**Production token issuance.** Before exposing a production deployment, set both
+`ADMIN_USERNAME` and `ADMIN_PASSWORD` using your deployment's secret configuration.
+The token issuer needs both values to restrict issuance to administrators in
+`NODE_ENV=production`. This is independent of Bitcoin network selection and of
+`PUBLIC_API_JWT_REQUIRED`, which controls authentication on the public Bitcoin
+and RGB++ routes.
+
+**Internal administration.** Internal administrative routes are disabled unless both `ADMIN_USERNAME` and
 `ADMIN_PASSWORD` are configured. When enabled, they require HTTP Basic
 authentication in every environment, independently of public JWT settings.
 Keep these routes on a private network or restrict them at the gateway, and only
-send admin credentials over HTTPS (or local loopback).
+send admin credentials over HTTPS (or local loopback). If a production deployment
+does not need remote administration, block internal administrative routes at the
+gateway rather than removing the credentials used by the token issuer.
 
 For a restricted deployment, enforce its access policy at the gateway or on a
 private network. If the deployment should only serve reads, explicitly allowlist

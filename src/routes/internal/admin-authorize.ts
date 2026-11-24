@@ -13,5 +13,5 @@ export default async function adminAuthorize(request: FastifyRequest, reply: Fas
     if (timingSafeEqual(digest(decoded), digest(`${username}:${password}`))) return;
   }
 
-  reply.code(401).send({ error: 'Unauthorized' });
+  reply.code(401).header('WWW-Authenticate', 'Basic realm="Internal Administration"').send({ error: 'Unauthorized' });
 }

@@ -71,9 +71,11 @@ describe('internal administrative route policy', () => {
     const valid = `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
     const invalid = `Basic ${Buffer.from(`${user}:wrong`).toString('base64')}`;
 
-    expect((await app.inject({ method: 'POST', url: path })).statusCode).toBe(401);
-    for (const authorization of ['Basic', invalid]) {
-      expect((await app.inject({ method: 'POST', url: path, headers: { authorization } })).statusCode).toBe(401);
+    for (const authorization of [undefined, 'Basic', invalid]) {
+      const headers = authorization ? { authorization } : {};
+      const response = await app.inject({ method: 'POST', url: path, headers });
+      expect(response.statusCode).toBe(401);
+      expect(response.headers['www-authenticate']).toBe('Basic realm="Internal Administration"');
     }
     expect(fixture.handler).not.toHaveBeenCalled();
 
@@ -81,9 +83,9 @@ describe('internal administrative route policy', () => {
     expect((await app.inject({ method: 'POST', url: path, headers })).statusCode).toBe(400);
     expect(fixture.handler).not.toHaveBeenCalled();
 
-    expect((await app.inject({ method: 'POST', url: path, headers, payload: { label: 'fixture' } })).statusCode).toBe(
-      200,
-    );
+    const response = await app.inject({ method: 'POST', url: path, headers, payload: { label: 'fixture' } });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['www-authenticate']).toBeUndefined();
     expect(fixture.handler).toHaveBeenCalledTimes(1);
   });
 });
