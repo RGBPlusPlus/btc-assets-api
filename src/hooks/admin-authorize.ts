@@ -1,22 +1,22 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { FastifyReply, FastifyRequest } from 'fastify';
 import { env } from '../env';
 
-export default async function adminAuthorize(request: FastifyRequest, reply: FastifyReply) {
-  const { authorization } = request.headers;
-  if (!authorization) {
-    reply.code(401).send({ error: 'Unauthorized' });
-    return;
-  }
+const digest = (value: string) => createHash('sha256').update(value).digest();
 
-  const [scheme, token] = authorization.split(' ');
-  if (scheme.toLowerCase() !== 'basic') {
-    reply.code(401).send({ error: 'Unauthorized' });
-    return;
-  }
+export function createAdminAuthorize(challenge?: string) {
+  return async (request: FastifyRequest, reply: FastifyReply) => {
+    const { ADMIN_USERNAME: username, ADMIN_PASSWORD: password } = env;
+    const token = /^Basic +([A-Za-z0-9+/]+={0,2})$/i.exec(request.headers.authorization ?? '')?.[1];
 
-  const [username, password] = Buffer.from(token, 'base64').toString().split(':');
-  if (username !== env.ADMIN_USERNAME || password !== env.ADMIN_PASSWORD) {
+    if (username && !username.includes(':') && password && token) {
+      const decoded = Buffer.from(token, 'base64').toString();
+      if (timingSafeEqual(digest(decoded), digest(`${username}:${password}`))) return;
+    }
+
+    if (challenge) reply.header('WWW-Authenticate', challenge);
     reply.code(401).send({ error: 'Unauthorized' });
-    return;
-  }
+  };
 }
+
+export default createAdminAuthorize();

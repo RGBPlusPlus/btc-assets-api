@@ -8,6 +8,7 @@ export default defineConfig({
       'test/utils/**/*.test.ts',
       'test/startup.test.ts',
       'test/plugins/public-api-auth.test.ts',
+      'test/routes/internal-auth.test.ts',
       'test/routes/rgbpp/activity-cursor.test.ts',
       'test/routes/rgbpp/address-assets.test.ts',
       'test/routes/rgbpp/pending-output-cells.test.ts',
