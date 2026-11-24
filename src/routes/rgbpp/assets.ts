@@ -143,7 +143,7 @@ const assetsRoute: FastifyPluginCallback<Record<never, never>, Server, ZodTypePr
       },
     },
     async (request) => {
-      const typeScript = getTypeScript(request.query.type_script);
+      const typeScript = getTypeScript(request.query.type_script, { allowWildcard: false });
       if (!typeScript) {
         return null;
       }

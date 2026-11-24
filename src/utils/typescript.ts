@@ -1,28 +1,32 @@
 import { blockchain } from '@ckb-lumos/base';
-import { Script } from '@ckb-lumos/lumos';
 import { isScriptEqual } from '@rgbpp-sdk/ckb';
-import { Cell } from '../routes/rgbpp/types';
+import { Cell, Script } from '../routes/rgbpp/types';
 
 /**
  * Get type script from request query
  */
-export function getTypeScript(type_script: string | Script | undefined) {
-  if (!type_script) {
-    return undefined;
-  }
-  let typeScript: Script | undefined = undefined;
-  if (type_script) {
-    if (typeof type_script === 'string') {
-      if (type_script.startsWith('0x')) {
-        typeScript = blockchain.Script.unpack(type_script);
-      } else {
-        typeScript = JSON.parse(decodeURIComponent(type_script));
-      }
-    } else {
-      typeScript = type_script;
+export function getTypeScript(type_script: string | Script | undefined, { allowWildcard = true } = {}) {
+  if (type_script === undefined) return undefined;
+
+  try {
+    const decoded =
+      typeof type_script !== 'string'
+        ? type_script
+        : type_script.startsWith('0x')
+          ? blockchain.Script.unpack(type_script)
+          : JSON.parse(decodeURIComponent(type_script));
+    const script = Script.parse(decoded);
+    // Empty args (without the prefix) are used by existing wildcard filters.
+    if (
+      !/^0x[0-9a-fA-F]{64}$/.test(script.codeHash) ||
+      (!/^0x(?:[0-9a-fA-F]{2})*$/.test(script.args) && !(allowWildcard && script.args === ''))
+    ) {
+      throw new Error('Invalid script bytes');
     }
+    return script;
+  } catch {
+    throw Object.assign(new Error('Invalid type_script'), { statusCode: 400 });
   }
-  return typeScript;
 }
 
 /**
