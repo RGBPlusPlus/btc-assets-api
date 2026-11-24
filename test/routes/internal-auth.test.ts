@@ -2,10 +2,12 @@ import fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { validatorCompiler } from 'fastify-type-provider-zod';
 import internalRoutes from '../../src/routes/internal';
+import tokenRoutes from '../../src/routes/token';
 
 const fixture = vi.hoisted(() => ({
   env: { NODE_ENV: 'development', PUBLIC_API_JWT_REQUIRED: false, ADMIN_USERNAME: '', ADMIN_PASSWORD: '' },
   handler: vi.fn(),
+  issuer: vi.fn(),
   resolve: vi.fn(),
 }));
 
@@ -18,6 +20,15 @@ vi.mock('../../src/routes/internal/job', async () => {
   return {
     default: async (app: FastifyInstance) => {
       app.post('/fixture', { schema: { body: z.object({ label: z.string() }) } }, async () => fixture.handler());
+    },
+  };
+});
+
+vi.mock('../../src/routes/token/generate', async () => {
+  const { z } = await import('zod');
+  return {
+    default: async (app: FastifyInstance) => {
+      app.post('/generate', { schema: { body: z.object({ label: z.string() }) } }, async () => fixture.issuer());
     },
   };
 });
@@ -88,4 +99,47 @@ describe('internal administrative route policy', () => {
     expect(response.headers['www-authenticate']).toBeUndefined();
     expect(fixture.handler).toHaveBeenCalledTimes(1);
   });
+});
+
+describe('token issuer admin policy', () => {
+  test.each([
+    { mode: 'production', configuredPassword: password, requiresAdmin: true },
+    { mode: 'production', configuredPassword: '', requiresAdmin: false },
+    { mode: 'development', configuredPassword: password, requiresAdmin: false },
+  ])(
+    'retains its activation policy ($mode, requiresAdmin=$requiresAdmin)',
+    async ({ mode, configuredPassword, requiresAdmin }) => {
+      fixture.issuer.mockClear();
+      fixture.issuer.mockReturnValue({ issued: true });
+      fixture.env.NODE_ENV = mode;
+      fixture.env.ADMIN_USERNAME = user;
+      fixture.env.ADMIN_PASSWORD = configuredPassword;
+      const app = fastify();
+      app.setValidatorCompiler(validatorCompiler);
+      app.register(tokenRoutes, { prefix: '/token' });
+      const url = '/token/generate';
+      const payload = { label: 'fixture' };
+      try {
+        if (requiresAdmin) {
+          for (const authorization of [
+            undefined,
+            'Basic',
+            `Basic ${Buffer.from(`${user}:incorrect`).toString('base64')}`,
+          ]) {
+            const response = await app.inject({ method: 'POST', url, headers: authorization ? { authorization } : {} });
+            expect(response.statusCode).toBe(401);
+            expect(response.headers['www-authenticate']).toBeUndefined();
+          }
+          expect(fixture.issuer).not.toHaveBeenCalled();
+          const authorization = `Basic ${Buffer.from(`${user}:${password}`).toString('base64')}`;
+          expect((await app.inject({ method: 'POST', url, headers: { authorization }, payload })).statusCode).toBe(200);
+        } else {
+          expect((await app.inject({ method: 'POST', url, payload })).statusCode).toBe(200);
+        }
+        expect(fixture.issuer).toHaveBeenCalledTimes(1);
+      } finally {
+        await app.close();
+      }
+    },
+  );
 });
