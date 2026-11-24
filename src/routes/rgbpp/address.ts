@@ -98,9 +98,9 @@ const addressRoutes: FastifyPluginCallback<Record<never, never>, Server, ZodType
     async (request) => {
       const { btc_address } = request.params;
       const { no_cache } = request.query;
+      const typeScript = getTypeScript(request.query.type_script);
       const utxos = await getUtxos(btc_address, no_cache);
       const cells = await getRgbppAssetsCells(btc_address, utxos, no_cache);
-      const typeScript = getTypeScript(request.query.type_script);
       const assetCells = typeScript ? filterCellsByTypeScript(cells, typeScript) : cells;
       return assetCells.map((cell) => {
         const typeHash = cell.cellOutput.type ? computeScriptHash(cell.cellOutput.type) : undefined;
