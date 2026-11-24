@@ -9,6 +9,7 @@ export default defineConfig({
       'test/startup.test.ts',
       'test/plugins/public-api-auth.test.ts',
       'test/routes/rgbpp/activity-cursor.test.ts',
+      'test/routes/rgbpp/address-assets.test.ts',
       'test/routes/rgbpp/pending-output-cells.test.ts',
       'test/services/bitcoin.test.ts',
       'test/services/ckb-metadata.test.ts',
