@@ -61,9 +61,12 @@ const envSchema = z
       }),
 
     /**
-     * The rate limit per minute for each IP address.
+     * The rate limit per minute for each IP address. Set to 0 to disable it.
      */
-    RATE_LIMIT_PER_MINUTE: z.coerce.number().default(100),
+    RATE_LIMIT_PER_MINUTE: z.preprocess(
+      (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+      z.coerce.number().default(100),
+    ),
     /**
      * The blocklist of IP addresses that are denied access to the API.
      */
