@@ -27,9 +27,9 @@ export default abstract class BaseQueueWorker<T, R> {
     });
     this.worker = new Worker(
       name,
-      async (job: Job<T>) => {
+      async (job: Job<T>, token?: string) => {
         const span = Sentry.startInactiveSpan({ name: this.constructor.name, op: 'process' });
-        const returnvalue = await this.process(job);
+        const returnvalue = await this.process(job, token);
         span?.end();
         return returnvalue;
       },
@@ -41,7 +41,7 @@ export default abstract class BaseQueueWorker<T, R> {
     );
   }
 
-  abstract process(job: Job<T>): Promise<R | void>;
+  abstract process(job: Job<T>, token?: string): Promise<R | void>;
 
   /**
    * Add a job to the queue
