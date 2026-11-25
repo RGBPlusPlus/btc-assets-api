@@ -3,6 +3,8 @@ import { env } from '../env';
 import rateLimit from '@fastify/rate-limit';
 
 export default fp(async (fastify) => {
+  if (env.RATE_LIMIT_PER_MINUTE === 0) return;
+
   try {
     const redis = fastify.container.resolve('redis');
     fastify.register(rateLimit, {
